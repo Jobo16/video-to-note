@@ -283,11 +283,15 @@ function bindEvents() {
     bindListener('mcpStatusChip', 'click', revealMcpAccess);
     bindListener('mcpHintGoBtn', 'click', revealMcpAccess);
     bindListener('mcpHintDismissBtn', 'click', dismissMcpHint);
-    bindListener('sourceType', 'change', toggleSourceType);
+    bindListener('sourceType', 'change', () => {
+        toggleSourceType();
+        resetSubmitLabel();
+    });
     bindPreferenceAutoSave();
     const videoUrl = byId('videoUrl');
     if (videoUrl) {
         videoUrl.addEventListener('input', () => {
+            resetSubmitLabel();
             window.clearTimeout(biliHintDebounce);
             biliHintDebounce = window.setTimeout(() => updateBiliHint(), 300);
             scheduleBiliPagesPreview();
@@ -305,7 +309,10 @@ function bindEvents() {
     bindListener('biliPagesInvertBtn', 'click', () => setBiliPagesSelection('invert'));
     initBiliLogin();
     bindListener('includeScreenshots', 'change', toggleScreenshotSettings);
-    bindListener('localFile', 'change', updateFileInfo);
+    bindListener('localFile', 'change', () => {
+        updateFileInfo();
+        resetSubmitLabel();
+    });
     initThemeControl();
     window.addEventListener('beforeunload', () => {
         stopPolling();
@@ -1355,9 +1362,7 @@ function applyOutputMode() {
                 + '产出带时间轴的字幕稿，可直接复制或下载，之后仍能在它基础上生成笔记。'
             : '';
     }
-    if (!isSubmitting && !isTaskActive) {
-        setSubmitButton(false, transcript ? '开始转写' : '开始生成');
-    }
+    resetSubmitLabel();
 }
 
 let biliHintDebounce = null;
@@ -2405,6 +2410,13 @@ function setSubmitButton(loading, label) {
     button.disabled = loading || isTaskActive;
     button.classList.toggle('is-loading', loading);
     button.querySelector('.btn-text').textContent = label;
+}
+
+// 换来源就是一次全新任务：留着「再次生成 / 重新提交」会让人以为还在接着上一个跑，
+// 而它其实会拿新链接从头开始（只是文案不对，行为没错）。
+function resetSubmitLabel() {
+    if (isSubmitting || isTaskActive) return;
+    setSubmitButton(false, isTranscriptMode() ? '开始转写' : '开始生成');
 }
 
 function setTaskState(type, text) {
