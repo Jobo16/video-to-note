@@ -213,6 +213,17 @@ def _looks_disconnected(exc: BaseException) -> bool:
     )
 
 
+def utf8_safe(text: str) -> str:
+    """把模型输出里编不进 UTF-8 的字符换成占位符。
+
+    输出被 max_tokens 截断时，emoji 常常只剩下半个代理对（U+D800–U+DFFF）。这种
+    字符拼进 str 不报错，一到 JSON 序列化才抛 UnicodeEncodeError，而且炸点在端点
+    return 之后：/api/llm-test 会崩成裸 500（前端只剩"测试请求失败（HTTP 500）"，
+    看着完全像上游挂了），笔记正文则会把 notes.md 与 task.json 的写入一起带崩。
+    """
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def _rejected_params_from_env() -> set[str]:
     """逃生口：`VIDEOTONOTES_REJECTED_LLM_PARAMS=thinking,reasoning_effort`。
 
@@ -283,7 +294,7 @@ class LLMSummarizer:
                 timeout=timeout_seconds,
             )
             latency = time.monotonic() - start
-            reply = (response.choices[0].message.content or "").strip()
+            reply = utf8_safe(response.choices[0].message.content or "").strip()
             if reply:
                 return True, f"连接成功（{latency * 1000:.0f} ms）模型响应：{reply[:40]}", latency
             return True, f"连接成功（{latency * 1000:.0f} ms）", latency
@@ -1398,7 +1409,7 @@ class LLMSummarizer:
                 f"模型未返回正文（finish_reason={finish_reason}）。"
                 "可尝试关闭深度思考、缩短转录或更换模型。"
             )
-        return content.strip()
+        return utf8_safe(content).strip()
 
     @staticmethod
     def _reasoning_characters(delta: Any) -> int:

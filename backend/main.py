@@ -22,8 +22,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import aiofiles
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 
@@ -50,6 +50,7 @@ from .llm_summarizer import (
     LLMSummarizer,
     default_base_url,
     normalize_endpoint_host,
+    utf8_safe,
 )
 from .bili_login import BiliLoginManager
 from .douyin_login import DouyinLoginManager
@@ -124,7 +125,7 @@ NOTE_IMAGE_REF_RE = re.compile(
     rf"(!\[[^\]]*\]\()\./(?:{FRAMES_DIR_NAME}|images)/([^)]+)\)"
 )
 
-app = FastAPI(title="VideoToNo API", version="1.4.1")
+app = FastAPI(title="VideoToNo API", version="1.4.2")
 
 
 def is_loopback_client(host: str | None) -> bool:
@@ -207,6 +208,23 @@ class LocalSecurityMiddleware:
 
 
 app.add_middleware(LocalSecurityMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """没兜住的异常一律回 JSON，而不是 uvicorn 那句纯文本 Internal Server Error。
+
+    前端 `extractErrorMessage` 只在响应是 JSON 时才取得到原因，裸 500 会退化成
+    "测试请求失败（HTTP 500）"——群里报障时既分不清是后端崩了、还是端口被别的
+    服务占着，也拿不到任何线索。traceback 由 Starlette 原样继续上抛，仍会进
+    `_app.log`，这里只负责把话说清楚。
+    """
+    reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"后端内部错误：{redact_secrets(reason)}（详情见本机 _app.log）"},
+    )
+
 
 video_processor = VideoProcessor(WORKSPACE_DIR)
 transcriber = WhisperTranscriber(WHISPER_CACHE_DIR)
