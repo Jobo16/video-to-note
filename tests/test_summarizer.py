@@ -73,9 +73,10 @@ def test_chunk_prompt_contains_segment_timestamps() -> None:
 
 
 def test_provider_defaults_use_current_model_families() -> None:
-    assert PROVIDER_DEFAULTS["deepseek"][1] == "deepseek-v4-flash"
+    assert PROVIDER_DEFAULTS["deepseek"][1] == "deepseek-flash"
     assert PROVIDER_DEFAULTS["openai"][1] == "gpt-5.6-terra"
-    assert PROVIDER_DEFAULTS["glm"][1] == "glm-4.5-flash"
+    assert PROVIDER_DEFAULTS["glm"][1] == "glm-4.7-flash"
+    assert PROVIDER_DEFAULTS["qwen"][1] == "qwen3.7-plus"
     assert PROVIDER_DEFAULTS["moonshot"][1] == "kimi-k3"
 
 

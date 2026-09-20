@@ -19,7 +19,8 @@ from .transcript import (
 
 
 PROVIDER_DEFAULTS = {
-    "deepseek": ("https://api.deepseek.com", "deepseek-v4-flash"),
+    # 与 frontend/script.js 的 PROVIDER_CONFIG.defaultModel 保持一致
+    "deepseek": ("https://api.deepseek.com", "deepseek-flash"),
     "openai": ("https://api.openai.com/v1", "gpt-5.6-terra"),
     "openai_gpt4": ("https://api.openai.com/v1", "gpt-4o"),
     "openai_gpt35": ("https://api.openai.com/v1", "gpt-4o-mini"),
@@ -27,7 +28,7 @@ PROVIDER_DEFAULTS = {
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "qwen3.7-plus",
     ),
-    "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-4.5-flash"),
+    "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-4.7-flash"),
     "moonshot": ("https://api.moonshot.cn/v1", "kimi-k3"),
 }
 

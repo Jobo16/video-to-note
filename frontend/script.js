@@ -47,10 +47,13 @@ const PROVIDER_CONFIG = {
     deepseek: {
         name: 'DeepSeek',
         baseUrl: 'https://api.deepseek.com',
-        defaultModel: 'deepseek-v4-flash',
+        defaultModel: 'deepseek-flash',
         models: [
-            ['deepseek-v4-flash', 'DeepSeek V4 Flash'],
-            ['deepseek-v4-pro', 'DeepSeek V4 Pro']
+            ['deepseek-flash', 'DeepSeek V4.1 Flash'],
+            ['deepseek-v4-pro', 'DeepSeek V4 Pro'],
+            // 旧名仍可调用（官方已把它并到 V4.1-Flash 并按 Flash 计价），留着是为了
+            // 不砸掉已存过这个 ID 的档案：下拉里找不到值会跳去「手动输入」并清空输入框
+            ['deepseek-v4-flash', 'DeepSeek V4 Flash（旧名 · 已并入 V4.1）']
         ]
     },
     openai: {
@@ -66,10 +69,12 @@ const PROVIDER_CONFIG = {
     glm: {
         name: '智谱 GLM',
         baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-        defaultModel: 'glm-4.5-flash',
+        defaultModel: 'glm-4.7-flash',
         models: [
+            ['glm-5.3', 'GLM-5.3'],
             ['glm-5.2', 'GLM-5.2'],
-            ['glm-4.5-flash', 'GLM-4.5-Flash（免费）']
+            ['glm-4.7-flash', 'GLM-4.7-Flash（免费）'],
+            ['glm-4.5-flash', 'GLM-4.5-Flash（已下线 · 自动转 4.7）']
         ]
     },
     qwen: {
@@ -77,9 +82,11 @@ const PROVIDER_CONFIG = {
         baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
         defaultModel: 'qwen3.7-plus',
         models: [
-            ['qwen3.7-max', 'Qwen3.7 Max'],
+            ['qwen3.8-max', 'Qwen3.8 Max'],
             ['qwen3.7-plus', 'Qwen3.7 Plus'],
-            ['qwen3.7-flash', 'Qwen3.7 Flash']
+            ['qwen3.8-flash', 'Qwen3.8 Flash'],
+            ['qwen3.7-max', 'Qwen3.7 Max（旧版）'],
+            ['qwen3.7-flash', 'Qwen3.7 Flash（旧版）']
         ]
     },
     moonshot: {
