@@ -1,4 +1,5 @@
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -858,3 +859,115 @@ def test_view_api_hint_when_no_credentials(
     with pytest.raises(RuntimeError, match="view 接口未返回可用数据") as exc:
         processor._extract_bilibili_api_info(_BILI_URL, {"sessdata": "s"})
     assert "扫码导入" not in str(exc.value)
+
+
+def _fail_urlopen(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> list[str]:
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        raise exc
+
+    monkeypatch.setattr("backend.video_processor.urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+def test_view_api_keeps_the_reason_a_request_died(tmp_path: Path) -> None:
+    """回退通道失败必须说清是怎么死的：以前 412、超时、DNS 失败全被吞成 code=None。"""
+    processor = VideoProcessor(tmp_path)
+    for exc, expected in (
+        (
+            urllib.error.HTTPError(_BILI_URL, 412, "Precondition Failed", None, None),
+            "HTTP 412 Precondition Failed",
+        ),
+        (urllib.error.URLError("Name or service not known"), "连接失败（Name or service not known）"),
+    ):
+        reason = processor._bili_request_error(exc)
+        assert reason == expected
+        message = processor._bili_payload_reason({"error": reason})
+        assert message == expected
+
+
+def test_bilibili_get_json_returns_reason_and_skips_pointless_resign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """传输层就没通时不再补一次 wbi 签名重试（超时场景能少等 20 秒）。"""
+    calls = _fail_urlopen(
+        monkeypatch, urllib.error.HTTPError(_BILI_URL, 412, "Precondition Failed", None, None)
+    )
+    payload = VideoProcessor._bilibili_get_json(
+        "https://api.bilibili.com/x/web-interface/view", {"bvid": "BV1xM4y1z7Kt"}, {}
+    )
+
+    assert payload == {"error": "HTTP 412 Precondition Failed"}
+    assert len(calls) == 1
+
+
+def test_bilibili_get_json_says_so_when_the_body_is_not_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """被拦截时 B 站会回一页 HTML，这句要能和"接口报错"区分开。"""
+
+    class FakeResponse:
+        def read(self):
+            return b"<html>blocked by risk control</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "backend.video_processor.urllib.request.urlopen",
+        lambda request, timeout=None: FakeResponse(),
+    )
+    payload = VideoProcessor._bilibili_get_json("https://api.bilibili.com/x", {}, {})
+
+    assert payload == {"error": "响应不是可解析的 JSON（JSONDecodeError）"}
+
+
+def test_fallback_message_names_the_real_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """截图上那种「code=None」以后要么写成因，要么写 B 站给的 message。"""
+    processor = VideoProcessor(tmp_path)
+
+    monkeypatch.setattr(
+        processor,
+        "_bilibili_get_json",
+        lambda url, params, headers: {"error": "HTTP 412 Precondition Failed"},
+    )
+    with pytest.raises(RuntimeError, match="HTTP 412 Precondition Failed") as blocked:
+        processor._extract_bilibili_api_info(_BILI_URL, {"sessdata": "s"})
+    assert "code=None" not in str(blocked.value)
+
+    # BV 号本身不存在时，B 站给的"请求错误"要能让用户看懂是自己链接的问题而不是被风控
+    monkeypatch.setattr(
+        processor,
+        "_bilibili_get_json",
+        lambda url, params, headers: {"code": -400, "message": "请求错误", "data": None},
+    )
+    with pytest.raises(RuntimeError, match="请求错误") as bad_id:
+        processor._extract_bilibili_api_info(_BILI_URL, {"sessdata": "s"})
+    assert "code=-400" in str(bad_id.value)
+
+
+def test_scan_qr_hint_only_when_the_failure_is_about_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没有凭据时该劝扫码，但链接本身不对 / 接口连不上时不该劝。"""
+    processor = VideoProcessor(tmp_path)
+    for payload, should_hint in (
+        ({"error": "HTTP 412 Precondition Failed"}, True),
+        ({"code": -101, "message": "账号未登录"}, True),
+        ({"code": -400, "message": "请求错误"}, False),
+        ({"code": -404, "message": "啥都木有"}, False),
+        ({"error": "连接失败（timed out）"}, False),
+    ):
+        monkeypatch.setattr(
+            processor, "_bilibili_get_json", lambda url, params, headers, p=payload: p
+        )
+        with pytest.raises(RuntimeError) as raised:
+            processor._extract_bilibili_api_info(_BILI_URL, None)
+        assert ("扫码导入" in str(raised.value)) is should_hint, payload
