@@ -478,6 +478,30 @@ class VideoProcessor:
         return None
 
     @staticmethod
+    def _bili_request_error(exc: Exception) -> str:
+        """把"压根没拿到 B 站 JSON"这件事翻译成能指认真凶的一句。
+
+        以前这里吞成空字典，用户只看到 code=None——412 风控、超时、DNS 失败、代理被
+        重置长得一模一样，群里报障只能来回问三轮。
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return f"HTTP {exc.code} {exc.reason}"
+        if isinstance(exc, urllib.error.URLError):
+            return f"连接失败（{exc.reason}）"
+        if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+            return f"响应不是可解析的 JSON（{type(exc).__name__}）"
+        return f"{type(exc).__name__}: {exc}"[:160]
+
+    @staticmethod
+    def _bili_payload_reason(payload: dict[str, Any]) -> str:
+        """回退通道失败时的成因：优先传输层错误，其次 B 站自己给的 code/message。"""
+        error = str(payload.get("error") or "")
+        if error:
+            return error
+        message = str(payload.get("message") or "")
+        return f"code={payload.get('code')}{f' {message}' if message else ''}"
+
+    @staticmethod
     def _bilibili_get_json(
         url: str, params: dict[str, Any], headers: dict[str, str]
     ) -> dict[str, Any]:
@@ -486,9 +510,14 @@ class VideoProcessor:
                 urllib.request.Request(f"{url}?{urlencode(params)}", headers=headers),
                 timeout=20,
             ) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except Exception:
-            return {}
+                raw = response.read()
+        except Exception as exc:
+            # 传输层就没通，补 wbi 签名也救不了，省掉那一次重试（超时场景能少等 20 秒）
+            return {"error": VideoProcessor._bili_request_error(exc)}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            return {"error": VideoProcessor._bili_request_error(exc)}
         if data.get("code") == 0:
             return data
         # 无签名被拒时补 wbi 签名重试
@@ -586,14 +615,22 @@ class VideoProcessor:
         )
         data = payload.get("data") or {}
         if int(payload.get("code") or 0) != 0 or not data.get("title"):
+            reason = self._bili_payload_reason(payload)
+            code = int(payload.get("code") or 0)
+            # B 站明确说"这个号/这个请求本身不对"（-400 请求错误、-404 啥都木有），或
+            # 压根连不上接口时，劝人扫码是误导——1.4.2 群测就有人对着不存在的链接反复
+            # 重新登录。其余情况（风控、未登录、返回了网页）仍按缺凭据提示。
+            says_bad_target = code in {-400, -404} or reason.startswith("连接失败")
             hint = (
-                "；未携带 B 站凭据，开放接口也会返回 412——请先扫码导入或填写 SESSDATA"
-                if not self._cookie_header(cookie)
-                else ""
+                ""
+                if says_bad_target
+                else (
+                    "；未携带 B 站凭据，开放接口也会返回 412——请先扫码导入或填写 SESSDATA"
+                    if not self._cookie_header(cookie)
+                    else ""
+                )
             )
-            raise RuntimeError(
-                f"view 接口未返回可用数据（code={payload.get('code')}）{hint}"
-            )
+            raise RuntimeError(f"view 接口未返回可用数据（{reason}）{hint}")
         pages = [
             {
                 "page": int(item.get("page") or index),

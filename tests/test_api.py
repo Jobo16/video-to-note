@@ -4,6 +4,7 @@ import json
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 import launcher
 from backend import main
 from backend.config_store import BILI_CREDENTIALS_FILE, ConfigStore
+from backend.llm_summarizer import LLMSummarizer, utf8_safe
 from backend.transcript import TranscriptSegment
 from backend.video_processor import (
     BiliPage,
@@ -122,7 +124,7 @@ def test_health_and_frontend_are_served() -> None:
     client = TestClient(main.app)
     health = client.get("/api/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "1.4.1"
+    assert health.json()["version"] == "1.4.2"
     assert health.json()["version"] == launcher.VERSION
     assert health.json()["service"] == "VideoToNo"
     assert health.json()["mode"] == "dev"  # 测试进程非打包；打包版应报 portable
@@ -149,6 +151,33 @@ def test_health_and_frontend_are_served() -> None:
     favicon = client.get("/favicon.ico")
     assert favicon.status_code == 200
     assert favicon.headers["content-type"].startswith("image/x-icon")
+
+
+def test_missing_frontend_page_explains_itself() -> None:
+    """界面文件读不到时不能只甩一句 Not Found——那看着就像端口被别的服务占了。
+
+    打包版是 onefile：解压出来的临时目录被安全软件或磁盘清理删掉之后，`/api/*` 全部
+    正常、`/` 却匹配不到任何路由（群测里那位"重启软件就好了"就是这个）。
+    """
+    client = TestClient(main.app)
+    missing = client.get("/no-such-page.html")
+
+    assert missing.status_code == 404
+    assert missing.headers["content-type"].startswith("text/html")
+    assert "Not Found" not in missing.text
+    # 用户要的是"下一步做什么"，不是我们的排查过程：动作必须排在解释前面
+    assert "退出" in missing.text
+    assert missing.text.index("这样做就好") < missing.text.index("界面文件")
+    assert "_app.log" in missing.text
+
+    # 接口路径不能被这条改写：调用方按 JSON 的 detail 判错
+    api = client.get("/api/no-such-endpoint")
+    assert api.status_code == 404
+    assert api.json()["detail"] == "Not Found"
+    # 我们自己抛的 404 仍要带原来的中文说明
+    gone = client.get("/api/task/does-not-exist")
+    assert gone.status_code == 404
+    assert "任务不存在" in gone.json()["detail"]
     app_icon = client.get("/icon.png")
     assert app_icon.status_code == 200
     assert app_icon.headers["content-type"].startswith("image/png")
@@ -1902,6 +1931,113 @@ def test_llm_test_resolves_key_by_endpoint_without_mixing_fields(
     ).json()
     assert typed["key_source"] == "本次请求提供"
     assert captured[-1]["api_key"] == "sk-typed"
+
+
+LONE_SURROGATE = chr(0xD83D)  # 半个代理对：被 max_tokens 截断的 emoji，编不成 UTF-8
+
+
+def test_utf8_safe_only_touches_unencodable_characters() -> None:
+    assert utf8_safe("正常 🏓 中文 换行\n") == "正常 🏓 中文 换行\n"
+    cleaned = utf8_safe("半个" + LONE_SURROGATE + "代理对")
+    assert LONE_SURROGATE not in cleaned
+    cleaned.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_generated_note_drops_unencodable_characters() -> None:
+    """正文里的半个代理对不能带进 notes.md 与 task.json 的写入。"""
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-x")
+
+    class FakeStream:
+        async def __aiter__(self):
+            for piece in ("# 笔记\n", LONE_SURROGATE, "收尾"):
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=piece), finish_reason=None
+                        )
+                    ]
+                )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None), finish_reason="stop"
+                    )
+                ]
+            )
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return FakeStream()
+
+    summarizer.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    text = await summarizer._complete("转录内容", max_tokens=100)
+
+    assert LONE_SURROGATE not in text
+    text.encode("utf-8")  # 修复前这一步抛 UnicodeEncodeError
+
+
+def test_llm_test_survives_lone_surrogate_in_model_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """模型回半个代理对时端点要正常返回，而不是崩成裸 500。
+
+    崩点在端点 return 之后的响应序列化阶段，罩在端点里的 except 抓不到；纯文本 500
+    到了前端只剩「测试请求失败（HTTP 500）」这句兜底话，看着完全像上游挂了。
+    """
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="Pong " + LONE_SURROGATE + " OK!")
+                    )
+                ]
+            )
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(main, "config_store", ConfigStore(tmp_path))
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/llm-test",
+        json={
+            "model_type": "custom",
+            "base_url": CORP_GATEWAY,
+            "model": "deepseek-v4-flash",
+            "api_key": "sk-typed",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert LONE_SURROGATE not in body["message"]
+
+
+def test_unhandled_backend_error_comes_back_as_json(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """后端自己崩了也得回 JSON，否则前端拿不到任何原因。"""
+
+    class Boom:
+        def keys_are_corrupt(self):
+            raise RuntimeError("模拟崩了 sk-abcdefghijklmnopqrstuvwxyz")
+
+    monkeypatch.setattr(main, "config_store", Boom())
+    response = TestClient(main.app, raise_server_exceptions=False).get("/api/llm-keys")
+    detail = response.json()["detail"]
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert "模拟崩了" in detail
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in detail  # 沿用 1.4.1 的脱敏口径
 
 
 # --------------------------------------------------------------------------- 转录出口

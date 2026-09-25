@@ -19,7 +19,8 @@ from .transcript import (
 
 
 PROVIDER_DEFAULTS = {
-    "deepseek": ("https://api.deepseek.com", "deepseek-v4-flash"),
+    # 与 frontend/script.js 的 PROVIDER_CONFIG.defaultModel 保持一致
+    "deepseek": ("https://api.deepseek.com", "deepseek-flash"),
     "openai": ("https://api.openai.com/v1", "gpt-5.6-terra"),
     "openai_gpt4": ("https://api.openai.com/v1", "gpt-4o"),
     "openai_gpt35": ("https://api.openai.com/v1", "gpt-4o-mini"),
@@ -27,7 +28,7 @@ PROVIDER_DEFAULTS = {
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "qwen3.7-plus",
     ),
-    "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-4.5-flash"),
+    "glm": ("https://open.bigmodel.cn/api/paas/v4", "glm-4.7-flash"),
     "moonshot": ("https://api.moonshot.cn/v1", "kimi-k3"),
 }
 
@@ -213,6 +214,17 @@ def _looks_disconnected(exc: BaseException) -> bool:
     )
 
 
+def utf8_safe(text: str) -> str:
+    """把模型输出里编不进 UTF-8 的字符换成占位符。
+
+    输出被 max_tokens 截断时，emoji 常常只剩下半个代理对（U+D800–U+DFFF）。这种
+    字符拼进 str 不报错，一到 JSON 序列化才抛 UnicodeEncodeError，而且炸点在端点
+    return 之后：/api/llm-test 会崩成裸 500（前端只剩"测试请求失败（HTTP 500）"，
+    看着完全像上游挂了），笔记正文则会把 notes.md 与 task.json 的写入一起带崩。
+    """
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def _rejected_params_from_env() -> set[str]:
     """逃生口：`VIDEOTONOTES_REJECTED_LLM_PARAMS=thinking,reasoning_effort`。
 
@@ -283,7 +295,7 @@ class LLMSummarizer:
                 timeout=timeout_seconds,
             )
             latency = time.monotonic() - start
-            reply = (response.choices[0].message.content or "").strip()
+            reply = utf8_safe(response.choices[0].message.content or "").strip()
             if reply:
                 return True, f"连接成功（{latency * 1000:.0f} ms）模型响应：{reply[:40]}", latency
             return True, f"连接成功（{latency * 1000:.0f} ms）", latency
@@ -1320,7 +1332,9 @@ class LLMSummarizer:
                 if content:
                     parts.append(content)
                     content_characters += len(content)
-                elif delta is not None:
+                # 不按"没有正文才算思考"分叉：有的通道把 reasoning_content 和 content
+                # 塞在同一个块里，那样会一个都不计，心跳与"关思考没生效"的判读都会失真
+                if delta is not None:
                     reasoning_characters += self._reasoning_characters(delta)
                 if getattr(choice, "finish_reason", None):
                     finish_reason = choice.finish_reason
@@ -1374,11 +1388,25 @@ class LLMSummarizer:
                     await closed
 
         content = "".join(parts)
+        # 把"我们下发了什么"与"通道实际给了什么"并排记下来：静默忽略关思考请求、或把
+        # max_tokens 悄悄砍小，都不会回 400，参数降级阶梯因此永远不触发，光看
+        # finish_reason=length 猜不到额度是谁缩的。
+        if effort == "off" and reasoning_characters:
+            # 不带阶段名与字数：这是通道级的事实，一次任务说一句就够（逐段直写会调几十次）
+            self._warn_once(
+                "该通道没有响应「关闭深度思考」的请求，仍在返回思考链；"
+                "这类通道上正文偏长时容易被思考吃满输出额度，可在界面上改选「高」或「最大」档"
+            )
         if not content:
+            outcome = (
+                f"下发 max_tokens={self._sent_token_budget(request)}、思考档={effort}，"
+                f"实际收到 思考 {reasoning_characters} 字 / 正文 0 字，"
+                f"finish_reason={finish_reason}"
+            )
             if retry_empty and effort != "off" and self._can_disable_thinking():
                 warning = (
-                    f"{stage}：模型未返回正文（finish_reason={finish_reason}，"
-                    "多为思考链吃满输出额度后流被截断），已关闭深度思考并重试"
+                    f"{stage}：模型未返回正文（{outcome}），"
+                    "多为思考链吃满输出额度后流被截断，已关闭深度思考并重试"
                 )
                 self.warnings.append(warning)
                 await self._report_progress(progress_callback, progress, warning)
@@ -1394,11 +1422,23 @@ class LLMSummarizer:
                     param_attempts=param_attempts,
                     budget=budget,
                 )
-            raise RuntimeError(
-                f"模型未返回正文（finish_reason={finish_reason}）。"
-                "可尝试关闭深度思考、缩短转录或更换模型。"
-            )
-        return content.strip()
+            # 已经关过思考却仍只收到思考 ⇒ 这条通道不认我们的关闭请求，再劝"关闭深度
+            # 思考"就是把人往死胡同里带（1.4.2 群测实测：off 档下发后仍累计 6473 字
+            # 思考、4600 额度吃满，正文一个字没出）。
+            if effort == "off":
+                advice = (
+                    "该通道没有响应关思考的请求，请改用「高」或「最大」档给正文留出额度，"
+                    "或缩短转录、更换模型。"
+                )
+            else:
+                advice = "可尝试关闭深度思考、缩短转录或更换模型。"
+            raise RuntimeError(f"模型未返回正文（{outcome}）。{advice}")
+        return utf8_safe(content).strip()
+
+    @staticmethod
+    def _sent_token_budget(request: dict[str, Any]) -> Any:
+        """本次实际下发的输出额度（OpenAI 新模型用的是另一个键名）。"""
+        return request.get("max_tokens") or request.get("max_completion_tokens") or "未下发"
 
     @staticmethod
     def _reasoning_characters(delta: Any) -> int:

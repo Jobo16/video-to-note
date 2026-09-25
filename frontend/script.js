@@ -47,10 +47,13 @@ const PROVIDER_CONFIG = {
     deepseek: {
         name: 'DeepSeek',
         baseUrl: 'https://api.deepseek.com',
-        defaultModel: 'deepseek-v4-flash',
+        defaultModel: 'deepseek-flash',
         models: [
-            ['deepseek-v4-flash', 'DeepSeek V4 Flash'],
-            ['deepseek-v4-pro', 'DeepSeek V4 Pro']
+            ['deepseek-flash', 'DeepSeek V4.1 Flash'],
+            ['deepseek-v4-pro', 'DeepSeek V4 Pro'],
+            // 旧名仍可调用（官方已把它并到 V4.1-Flash 并按 Flash 计价），留着是为了
+            // 不砸掉已存过这个 ID 的档案：下拉里找不到值会跳去「手动输入」并清空输入框
+            ['deepseek-v4-flash', 'DeepSeek V4 Flash（旧名 · 已并入 V4.1）']
         ]
     },
     openai: {
@@ -66,10 +69,12 @@ const PROVIDER_CONFIG = {
     glm: {
         name: '智谱 GLM',
         baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-        defaultModel: 'glm-4.5-flash',
+        defaultModel: 'glm-4.7-flash',
         models: [
+            ['glm-5.3', 'GLM-5.3'],
             ['glm-5.2', 'GLM-5.2'],
-            ['glm-4.5-flash', 'GLM-4.5-Flash（免费）']
+            ['glm-4.7-flash', 'GLM-4.7-Flash（免费）'],
+            ['glm-4.5-flash', 'GLM-4.5-Flash（已下线 · 自动转 4.7）']
         ]
     },
     qwen: {
@@ -77,9 +82,11 @@ const PROVIDER_CONFIG = {
         baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
         defaultModel: 'qwen3.7-plus',
         models: [
-            ['qwen3.7-max', 'Qwen3.7 Max'],
+            ['qwen3.8-max', 'Qwen3.8 Max'],
             ['qwen3.7-plus', 'Qwen3.7 Plus'],
-            ['qwen3.7-flash', 'Qwen3.7 Flash']
+            ['qwen3.8-flash', 'Qwen3.8 Flash'],
+            ['qwen3.7-max', 'Qwen3.7 Max（旧版）'],
+            ['qwen3.7-flash', 'Qwen3.7 Flash（旧版）']
         ]
     },
     moonshot: {
@@ -159,7 +166,12 @@ async function loadAppVersion() {
     try {
         const response = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
         const data = await readResponse(response, '读取版本失败');
-        if (data.version) byId('appVersion').textContent = `v${data.version}`;
+        if (data.version) {
+            // 端口跟着版本一起露出来：本机同时跑着两个实例、或用户开的是上一个实例
+            // 留下的地址时，这是唯一能一眼对上的东西
+            const port = window.location.port ? ` · 端口 ${window.location.port}` : '';
+            byId('appVersion').textContent = `v${data.version}${port}`;
+        }
         applyUploadLimit(data.max_upload_mb);
         applyMcpAccess(data.dependencies?.mcp_sse);
     } catch {
@@ -283,11 +295,15 @@ function bindEvents() {
     bindListener('mcpStatusChip', 'click', revealMcpAccess);
     bindListener('mcpHintGoBtn', 'click', revealMcpAccess);
     bindListener('mcpHintDismissBtn', 'click', dismissMcpHint);
-    bindListener('sourceType', 'change', toggleSourceType);
+    bindListener('sourceType', 'change', () => {
+        toggleSourceType();
+        resetSubmitLabel();
+    });
     bindPreferenceAutoSave();
     const videoUrl = byId('videoUrl');
     if (videoUrl) {
         videoUrl.addEventListener('input', () => {
+            resetSubmitLabel();
             window.clearTimeout(biliHintDebounce);
             biliHintDebounce = window.setTimeout(() => updateBiliHint(), 300);
             scheduleBiliPagesPreview();
@@ -305,7 +321,10 @@ function bindEvents() {
     bindListener('biliPagesInvertBtn', 'click', () => setBiliPagesSelection('invert'));
     initBiliLogin();
     bindListener('includeScreenshots', 'change', toggleScreenshotSettings);
-    bindListener('localFile', 'change', updateFileInfo);
+    bindListener('localFile', 'change', () => {
+        updateFileInfo();
+        resetSubmitLabel();
+    });
     initThemeControl();
     window.addEventListener('beforeunload', () => {
         stopPolling();
@@ -1355,9 +1374,7 @@ function applyOutputMode() {
                 + '产出带时间轴的字幕稿，可直接复制或下载，之后仍能在它基础上生成笔记。'
             : '';
     }
-    if (!isSubmitting && !isTaskActive) {
-        setSubmitButton(false, transcript ? '开始转写' : '开始生成');
-    }
+    resetSubmitLabel();
 }
 
 let biliHintDebounce = null;
@@ -2405,6 +2422,13 @@ function setSubmitButton(loading, label) {
     button.disabled = loading || isTaskActive;
     button.classList.toggle('is-loading', loading);
     button.querySelector('.btn-text').textContent = label;
+}
+
+// 换来源就是一次全新任务：留着「再次生成 / 重新提交」会让人以为还在接着上一个跑，
+// 而它其实会拿新链接从头开始（只是文案不对，行为没错）。
+function resetSubmitLabel() {
+    if (isSubmitting || isTaskActive) return;
+    setSubmitButton(false, isTranscriptMode() ? '开始转写' : '开始生成');
 }
 
 function setTaskState(type, text) {

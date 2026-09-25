@@ -2,7 +2,7 @@
   <img src="sources/icon.png" width="96" alt="VideoToNo icon">
 </p>
 
-<h1 align="center">VideoToNo v1.4.1</h1>
+<h1 align="center">VideoToNo v1.4.2</h1>
 
 <p align="center"><em>Turn videos into Markdown notes you can revisit</em></p>
 
@@ -18,17 +18,17 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 > 🤖 **Agent Skill available**: copy the `skills/video-to-note/` directory from this repo into your agent's skills directory (e.g. `~/.agents/skills/`) and coding agents like Claude Code or pi can generate video notes from a single sentence. See `SKILL.md` inside that directory.
 
-## 🆕 What's New (v1.4.0 → v1.4.1)
+## 🆕 What's New (v1.4.1 → v1.4.2)
 
-- **Notes with screenshots keep their pictures on export**: the Markdown download now ships the screenshots alongside it, and the HTML export carries them inside the single file; old tasks just need re-exporting
-- **Which transcription model to pick**: the dropdown is now labeled from on-device benchmarks — "best for Chinese" vs "not recommended", with nothing removed
-- **Fixed manual import for `paraformer-zh`**: it no longer points you at an empty folder, and the checklist no longer asks for files that engine never reads
-- **Easier to find the MCP entry**: a new "Let an agent connect (MCP)" section in the sidebar copies your local address or a ready-to-paste client config
-- **Privacy**: an API key no longer appears in plain text in model errors, run logs or notifications; the Agent Skill can take the key via stdin or an environment variable
+- **The model list is up to date**: DeepSeek V4.1 Flash, GLM-5.3 with the free GLM-4.7-Flash tier, and Qwen3.8 are now in the dropdown; nothing was removed, so profiles you saved keep working
+- **Errors tell you what to do next**: "connection test failed", "Bilibili returned nothing" and "the model produced no note body" used to end in a bare code. They now say whose problem it is and what to change — you won't be told to sign in again when the fix is a different reasoning tier
+- **A page that won't load says so**: instead of a lone Not Found you get a short set of steps, and the local port now shows next to the version, so two instances on one machine are easy to tell apart
+- **Paste a new link and the button resets**: it no longer sits on "Generate again" while you are clearly starting a different video
 
 <details>
-<summary>Previous releases (v1.4.0 and earlier)</summary>
+<summary>Previous releases (v1.4.1 and earlier)</summary>
 
+- **v1.4.1**: notes with screenshots keep their pictures on export (the Markdown download ships the screenshots, the HTML export carries them, old tasks just need re-exporting); the Whisper dropdown is labeled from on-device benchmarks; manual import for `paraformer-zh` no longer points at an empty folder; a "Let an agent connect (MCP)" section in the sidebar; API keys no longer appear in plain text in model errors, run logs or notifications.
 - **v1.4.0**: hour-plus lectures are now transcribed into a complete chronological note instead of losing the back half (3-hour courses no longer drop roughly 2 hours), with an overview plus a table of contents carrying time ranges; drafting is an order of magnitude faster (a 3-hour course in about 10 minutes); note formulas render in the preview and in exported Markdown; two faster Chinese engines (paraformer-zh, belle-turbo-zh) plus CPU decode tuning; transcription reports progress every 30 seconds; Bilibili multi-part selection before submitting, remembered per video; model profiles renameable from the dropdown; failure messages now name the platform and stage that actually need checking.
 - **v1.3.5**: new "Transcript only" output (no LLM, no key; transcripts can switch to the note route later); the transcript exit opened to MCP / Skill (`transcribe_video` + `get_transcript`); transcripts of failed tasks remain fetchable; local videos work on first upload (no fail-then-retry) with the 2 GB limit truly in place; GPU falls back to CPU when CUDA runtime libraries are missing; pending tasks can be deleted.
 - **v1.3.0**: API keys and Bilibili credentials can be **saved to this machine per endpoint address** (DPAPI-encrypted on Windows, reused only when the target address matches, with a key-state chip beside the input); model profiles each remember their own model and custom endpoints become named profiles with autosave; cancellation now reaches *Cancelled* instantly in every stage (measured 18.6s → 0.02s); fixed model IDs bleeding across profiles and early failures leaving tasks in `processing`; MCP gained `list_llm_keys`, `save_llm_config` labels, and `endpoints` / `key_storage` in `get_saved_config`.
@@ -61,7 +61,7 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 ## 🚀 Portable build (recommended)
 
-No Python or development setup is required. Download `VideoToNo-1.4.1-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
+No Python or development setup is required. Download `VideoToNo-1.4.2-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
 
 1. Download and double-click the exe;
 2. Wait for the local page to open in your browser;

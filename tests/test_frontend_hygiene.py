@@ -59,3 +59,33 @@ def test_note_images_are_resolved_on_every_output_path() -> None:
 def test_every_bound_element_id_exists_in_the_page() -> None:
     missing = sorted(set(BOUND_ID.findall(SCRIPT)) - set(DECLARED_ID.findall(PAGE)))
     assert not missing, f"script.js 绑定了页面里不存在的元素：{missing}"
+
+
+def _builtin_providers() -> dict[str, dict[str, str]]:
+    config = SCRIPT.split("const PROVIDER_CONFIG = ", 1)[1]
+    found: dict[str, dict[str, str]] = {}
+    for provider in ("deepseek", "openai", "glm", "qwen", "moonshot"):
+        section = config.split(f"\n    {provider}: {{", 1)[1].split("\n    }},", 1)[0]
+        found[provider] = {
+            "baseUrl": re.search(r"baseUrl: '([^']*)'", section).group(1),
+            "defaultModel": re.search(r"defaultModel: '([^']*)'", section).group(1),
+        }
+    return found
+
+
+def test_builtin_provider_defaults_agree_between_front_and_back() -> None:
+    """前端下拉的默认档/地址必须与后端 ``PROVIDER_DEFAULTS`` 是同一个值。
+
+    两处各写一份（前端要显示名字，后端要兜住不带 model 的请求，例如 MCP 与 skill），
+    换模型时只改一边就会出现"页面上选的是新模型、实际请求打到旧 ID"这种没人看得见
+    的错——1.4.2 换 DeepSeek/GLM/Qwen 档位时就是这个形状。
+    """
+    from backend.llm_summarizer import PROVIDER_DEFAULTS
+
+    for provider, fields in _builtin_providers().items():
+        base_url, model = PROVIDER_DEFAULTS[provider]
+        assert fields["baseUrl"] == base_url, f"{provider} 接口地址两边不一致"
+        assert fields["defaultModel"] == model, (
+            f"{provider} 默认模型两边不一致：前端 {fields['defaultModel']} "
+            f"≠ 后端 {model}"
+        )

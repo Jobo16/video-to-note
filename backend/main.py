@@ -22,9 +22,10 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import aiofiles
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -50,6 +51,7 @@ from .llm_summarizer import (
     LLMSummarizer,
     default_base_url,
     normalize_endpoint_host,
+    utf8_safe,
 )
 from .bili_login import BiliLoginManager
 from .douyin_login import DouyinLoginManager
@@ -124,7 +126,7 @@ NOTE_IMAGE_REF_RE = re.compile(
     rf"(!\[[^\]]*\]\()\./(?:{FRAMES_DIR_NAME}|images)/([^)]+)\)"
 )
 
-app = FastAPI(title="VideoToNo API", version="1.4.1")
+app = FastAPI(title="VideoToNo API", version="1.4.2")
 
 
 def is_loopback_client(host: str | None) -> bool:
@@ -207,6 +209,55 @@ class LocalSecurityMiddleware:
 
 
 app.add_middleware(LocalSecurityMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """没兜住的异常一律回 JSON，而不是 uvicorn 那句纯文本 Internal Server Error。
+
+    前端 `extractErrorMessage` 只在响应是 JSON 时才取得到原因，裸 500 会退化成
+    "测试请求失败（HTTP 500）"——群里报障时既分不清是后端崩了、还是端口被别的
+    服务占着，也拿不到任何线索。traceback 由 Starlette 原样继续上抛，仍会进
+    `_app.log`，这里只负责把话说清楚。
+    """
+    reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"后端内部错误：{redact_secrets(reason)}（详情见本机 _app.log）"},
+    )
+
+
+FRONTEND_MISSING_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>VideoToNo 界面没加载出来</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:34em;margin:14vh auto;padding:0 1.2em;line-height:1.9">
+<h1>界面没加载出来</h1>
+<p><strong>这样做就好：</strong>在右下角任务栏找到 VideoToNo 图标，右键选「退出」，
+再双击打开程序。找不到那个图标的话，直接再双击一次程序也行。</p>
+<p>要是反复出现，请把程序目录里 <code>workspace\\_app.log</code> 发给作者，
+并说一下你地址栏里的端口号（这台机器上是 __PORT__）。</p>
+<p style="color:#666">程序本身在正常运行，只是界面文件没读到——不是端口被别的软件占了。</p>
+</body></html>
+"""
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> Response:
+    """从浏览器地址栏打开的 404 说人话；/api 与 /mcp 仍按原样回 JSON。
+
+    打包版是 onefile，运行时把前端解压到临时目录。那个目录一旦被安全软件或磁盘清理
+    删掉，`/api/*` 全部正常而 `/` 只剩一句 `{"detail":"Not Found"}`——连排查的人都会
+    误判成端口问题，用户只能靠重启软件碰运气（重启会重新解压，所以"重启就好了"）。
+    """
+    if exc.status_code == 404 and not request.url.path.startswith(("/api", "/mcp")):
+        port = (request.scope.get("server") or (None, None))[1]
+        return HTMLResponse(
+            status_code=404,
+            content=FRONTEND_MISSING_HTML.replace("__PORT__", str(port or "未知")),
+        )
+    return JSONResponse(
+        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+    )
+
 
 video_processor = VideoProcessor(WORKSPACE_DIR)
 transcriber = WhisperTranscriber(WHISPER_CACHE_DIR)
