@@ -166,7 +166,12 @@ async function loadAppVersion() {
     try {
         const response = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
         const data = await readResponse(response, '读取版本失败');
-        if (data.version) byId('appVersion').textContent = `v${data.version}`;
+        if (data.version) {
+            // 端口跟着版本一起露出来：本机同时跑着两个实例、或用户开的是上一个实例
+            // 留下的地址时，这是唯一能一眼对上的东西
+            const port = window.location.port ? ` · 端口 ${window.location.port}` : '';
+            byId('appVersion').textContent = `v${data.version}${port}`;
+        }
         applyUploadLimit(data.max_upload_mb);
         applyMcpAccess(data.dependencies?.mcp_sse);
     } catch {

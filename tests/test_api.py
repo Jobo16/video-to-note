@@ -151,6 +151,33 @@ def test_health_and_frontend_are_served() -> None:
     favicon = client.get("/favicon.ico")
     assert favicon.status_code == 200
     assert favicon.headers["content-type"].startswith("image/x-icon")
+
+
+def test_missing_frontend_page_explains_itself() -> None:
+    """界面文件读不到时不能只甩一句 Not Found——那看着就像端口被别的服务占了。
+
+    打包版是 onefile：解压出来的临时目录被安全软件或磁盘清理删掉之后，`/api/*` 全部
+    正常、`/` 却匹配不到任何路由（群测里那位"重启软件就好了"就是这个）。
+    """
+    client = TestClient(main.app)
+    missing = client.get("/no-such-page.html")
+
+    assert missing.status_code == 404
+    assert missing.headers["content-type"].startswith("text/html")
+    assert "Not Found" not in missing.text
+    # 用户要的是"下一步做什么"，不是我们的排查过程：动作必须排在解释前面
+    assert "退出" in missing.text
+    assert missing.text.index("这样做就好") < missing.text.index("界面文件")
+    assert "_app.log" in missing.text
+
+    # 接口路径不能被这条改写：调用方按 JSON 的 detail 判错
+    api = client.get("/api/no-such-endpoint")
+    assert api.status_code == 404
+    assert api.json()["detail"] == "Not Found"
+    # 我们自己抛的 404 仍要带原来的中文说明
+    gone = client.get("/api/task/does-not-exist")
+    assert gone.status_code == 404
+    assert "任务不存在" in gone.json()["detail"]
     app_icon = client.get("/icon.png")
     assert app_icon.status_code == 200
     assert app_icon.headers["content-type"].startswith("image/png")

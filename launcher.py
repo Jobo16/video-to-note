@@ -318,7 +318,7 @@ def run_tray(url: str, workspace: Path, server: Any) -> int:
         pystray.MenuItem("检查更新", check_for_updates),
         pystray.MenuItem("退出", on_quit),
     )
-    icon = pystray.Icon("videotono", tray_icon_image(), APP_NAME, menu)
+    icon = pystray.Icon("videotono", tray_icon_image(), f"{APP_NAME} · {url}", menu)
     # 任务结果通知：把 backend 的完成/失败事件接到托盘气泡（Windows 通知）
     try:
         from backend import main as backend_main
