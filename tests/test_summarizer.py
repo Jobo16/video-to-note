@@ -20,13 +20,15 @@ from backend.llm_summarizer import (
 from backend.transcript import TranscriptSegment, segments_to_prompt
 
 
-def _stream_response(content: str | None, finish_reason: str = "stop"):
+def _stream_response(
+    content: str | None, finish_reason: str = "stop", reasoning: str | None = None
+):
     """构造一个假的大模型流式响应（_complete 现按流式逐块读取）。"""
     async def gen():
         yield SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    delta=SimpleNamespace(content=content),
+                    delta=SimpleNamespace(content=content, reasoning_content=reasoning),
                     finish_reason=finish_reason,
                 )
             ]
@@ -1522,11 +1524,64 @@ async def test_empty_thinking_response_retries_with_thinking_disabled() -> None:
     assert requests[0]["extra_body"]["thinking"]["type"] == "enabled"
     assert requests[1]["extra_body"]["thinking"]["type"] == "disabled"
     expected_warning = (
-        "正在补充点评与分析：模型未返回正文（finish_reason=length，"
-        "多为思考链吃满输出额度后流被截断），已关闭深度思考并重试"
+        "正在补充点评与分析：模型未返回正文（下发 max_tokens=800、思考档=high，"
+        "实际收到 思考 0 字 / 正文 0 字，finish_reason=length），"
+        "多为思考链吃满输出额度后流被截断，已关闭深度思考并重试"
     )
     assert progress == [(93, expected_warning)]
     assert summarizer.warnings == [expected_warning]
+
+
+def _deepseek_offline(create) -> LLMSummarizer:
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.model_type = "deepseek"
+    summarizer.model = "deepseek-flash"
+    summarizer.base_url = "https://api.deepseek.com"
+    summarizer.warnings = []
+    summarizer.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    return summarizer
+
+
+@pytest.mark.asyncio
+async def test_channel_ignoring_thinking_off_says_so_instead_of_repeating_advice() -> None:
+    """1.4.2 群测实测：off 档下发后仍累计 6473 字思考，4600 额度吃满、正文一个字没出。
+
+    这句报错以前固定写着"可尝试关闭深度思考"——而他的档位正是关着的，于是照着它反复
+    重投、重登，白绕一圈。
+    """
+    requests: list[dict] = []
+
+    async def create(**kwargs):
+        requests.append(kwargs)
+        return _stream_response(None, "length", reasoning="思" * 6473)
+
+    summarizer = _deepseek_offline(create)
+    with pytest.raises(RuntimeError) as raised:
+        await summarizer._complete("测试", 4_600, "off", stage="正在生成完整笔记")
+
+    text = str(raised.value)
+    assert "该通道没有响应关思考的请求" in text
+    assert "可尝试关闭深度思考" not in text
+    assert "思考 6473 字 / 正文 0 字" in text
+    assert "max_tokens=4600" in text
+    assert len(requests) == 1  # 已经是 off，不该再白跑一次"关掉思考"的重试
+
+
+@pytest.mark.asyncio
+async def test_thinking_leak_is_reported_once_even_when_the_note_succeeds() -> None:
+    """成功出稿也要提一句这条通道的开关是空的，别等长正文被噎死才发现。"""
+
+    async def create(**kwargs):
+        return _stream_response("正文", "stop", reasoning="思考链")
+
+    summarizer = _deepseek_offline(create)
+    for _ in range(3):  # 逐段直写会调几十次，告警只该说一句
+        assert await summarizer._complete("测试", 4_600, "off") == "正文"
+
+    assert len(summarizer.warnings) == 1
+    assert "没有响应「关闭深度思考」" in summarizer.warnings[0]
 
 
 @pytest.mark.asyncio
