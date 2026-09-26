@@ -5,6 +5,7 @@ import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -124,7 +125,7 @@ def test_health_and_frontend_are_served() -> None:
     client = TestClient(main.app)
     health = client.get("/api/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "1.4.2"
+    assert health.json()["version"] == "1.4.3"
     assert health.json()["version"] == launcher.VERSION
     assert health.json()["service"] == "VideoToNo"
     assert health.json()["mode"] == "dev"  # 测试进程非打包；打包版应报 portable
@@ -575,6 +576,73 @@ def test_download_returns_markdown_file(
     assert response.content.decode("utf-8") == "# 下载测试"
     assert ".md" in response.headers["content-disposition"]
     assert not (task_dir / "video-notes.zip").exists()
+    main.tasks.pop(task_id, None)
+
+
+def test_download_stem_marks_parts_and_transcripts() -> None:
+    """同一视频逐 P 跑、或先转写后笔记，产物不能全叫一个名字。"""
+    one_of_three = {
+        "bili_pages": [{"page": 2, "part": "第二章 梯度"}],
+        "bili_total_pages": 3,
+    }
+    assert main.download_stem("深度学习课", one_of_three) == "深度学习课【P2 第二章 梯度】"
+    assert (
+        main.download_stem("深度学习课", one_of_three, "transcript")
+        == "深度学习课【P2 第二章 梯度】【转录】"
+    )
+    # 单 P 视频、以及一次跑完的分 P 视频：没有歧义，不加噪声
+    assert main.download_stem("深度学习课", {"bili_total_pages": 1}) == "深度学习课"
+    assert main.download_stem(
+        "深度学习课",
+        {
+            "bili_pages": [{"page": 1, "part": "第一章"}, {"page": 2, "part": "第二章"}],
+            "bili_total_pages": 2,
+        },
+    ) == "深度学习课"
+    # 多个分 P 的子集只报页码：分 P 名逐个拼进文件名会长到没法看
+    assert main.download_stem(
+        "深度学习课",
+        {
+            "bili_pages": [{"page": 1, "part": "甲"}, {"page": 3, "part": "丙"}],
+            "bili_total_pages": 5,
+        },
+    ) == "深度学习课【P1、3】"
+    # 80 字预算里被保住的是后缀，不是标题尾部
+    long_name = main.download_stem("长" * 90, one_of_three)
+    assert len(long_name) == 80 and long_name.endswith("【P2 第二章 梯度】")
+
+
+def test_download_names_files_after_the_part_and_status_shows_the_same_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """网页端拼 txt/html/png 用的名字必须来自后端，和 .md 下载同一个来源。"""
+    task_id = "part-naming"
+    task_dir = tmp_path / task_id
+    task_dir.mkdir()
+    (task_dir / "notes.md").write_text("# 分P笔记", encoding="utf-8")
+    (task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "title": "深度学习课",
+                "bili_pages": [{"page": 2, "part": "第二章 梯度"}],
+                "bili_total_pages": 3,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    main.tasks[task_id] = main.new_task()
+    main.tasks[task_id].update(status="completed", result={"title": "深度学习课"})
+
+    status = TestClient(main.app).get(f"/api/task/{task_id}").json()
+    response = TestClient(main.app).get(f"/api/download/{task_id}")
+
+    assert status["download_name"] == "深度学习课【P2 第二章 梯度】"
+    assert "深度学习课【P2 第二章 梯度】.md" in unquote(
+        response.headers["content-disposition"]
+    )
     main.tasks.pop(task_id, None)
 
 
@@ -1461,6 +1529,77 @@ async def test_pipeline_passes_bilibili_pages_to_subtitle_fetch(
     assert captured["only_pages"] == [1, 2]
 
 
+@pytest.mark.asyncio
+async def test_single_part_task_archives_under_the_part_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只跑一个分 P 的任务，归档与状态里的名字要带上 P 号和分 P 名。
+
+    这条钉的是整条链：view 接口给的分 P 清单 → task.json → 文件名。缺任一环，
+    用户从下载目录拿到的就是几个同名的 `深度学习课.md`。
+    """
+    processor = VideoProcessor(tmp_path)
+
+    async def fake_info(*args, **kwargs):
+        return {"title": "深度学习课", "source": "bilibili", "duration": 0, "owner": "作者"}
+
+    async def fake_subtitles(*args, **kwargs):
+        return None
+
+    async def fake_bili_subtitles(url, cookie=None, only_pages=None):
+        page = BiliPage(page=2, part="第二章 梯度", cid=102, duration=90)
+        sub = SubtitleResult(
+            [TranscriptSegment(0, 5, "P2字幕")], "zh-CN", "bilibili_ai_subtitle"
+        )
+        return BiliSubtitleOutcome(
+            sub,
+            "ok",
+            title="深度学习课",
+            total_pages=3,
+            pages=(page,),
+            subtitle_by_page=((2, sub),),
+        )
+
+    class FakeSummarizer:
+        def __init__(self, **kwargs):
+            pass
+        def describe_effort(self, reasoning_effort: str, style: str) -> str:
+            return reasoning_effort
+
+        async def generate_summary(self, *args, **kwargs):
+            return "# 测试笔记"
+
+    monkeypatch.setattr(processor, "get_video_info", fake_info)
+    monkeypatch.setattr(processor, "fetch_subtitles", fake_subtitles)
+    monkeypatch.setattr(processor, "fetch_bilibili_subtitles", fake_bili_subtitles)
+    monkeypatch.setattr(main, "video_processor", processor)
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "LLMSummarizer", FakeSummarizer)
+
+    task_id = "single-part-name"
+    (tmp_path / task_id).mkdir()
+    main.tasks[task_id] = main.new_task()
+    request = main.SummarizeRequest(
+        video_url="https://www.bilibili.com/video/BV1xx?p=2",
+        bilibili_pages=[2],
+        llm_config=main.LLMConfig(model_type="deepseek", api_key="test-key"),
+    )
+
+    await main.process_video_task(task_id, request)
+
+    expected = "深度学习课【P2 第二章 梯度】"
+    assert main.tasks[task_id]["status"] == "completed"
+    assert json.loads((tmp_path / task_id / "task.json").read_text("utf-8"))[
+        "bili_pages"
+    ] == [{"page": 2, "part": "第二章 梯度"}]
+    assert (tmp_path / "notes" / f"{expected}.md").is_file()
+
+    client = TestClient(main.app)
+    assert client.get(f"/api/task/{task_id}").json()["download_name"] == expected
+    assert expected in unquote(client.get(f"/api/download/{task_id}").headers["content-disposition"])
+    main.tasks.pop(task_id, None)
+
+
 def test_bili_pages_endpoint_returns_page_list(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_pages(url, cookie=None):
         return BiliVideoInfo(
@@ -2205,6 +2344,7 @@ def test_download_falls_back_to_transcript_without_notes(tmp_path, monkeypatch) 
 
     assert response.status_code == 200
     assert "字幕稿正文" in response.text
+    assert "字幕稿【转录】.md" in unquote(response.headers["content-disposition"])
     main.tasks.pop(task_id, None)
 
 

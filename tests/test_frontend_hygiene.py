@@ -56,6 +56,19 @@ def test_note_images_are_resolved_on_every_output_path() -> None:
     assert "serverFilename(" in markdown_download, "带截图时后端发的是 zip，后缀不能写死"
 
 
+def test_browser_side_downloads_are_named_after_the_note() -> None:
+    """txt / html / json / png 由浏览器自己拼文件名，只能取后端下发的下载名。
+
+    写死 `video_summary_时间戳` 时，同一视频逐 P 导出的几份纯文本除了时间戳
+    全都一样，用户根本分不清哪份是哪个 P。
+    """
+    assert "function noteFileName(" in SCRIPT
+    for name in ("downloadSummary", "exportSummaryImage", "downloadCanvasPages"):
+        body = SCRIPT.split(f"function {name}(", 1)[1].split("\n}\n", 1)[0]
+        assert "noteFileName(" in body, f"{name} 里的下载没取后端下发的文件名"
+    assert SCRIPT.count("task.download_name") == 2, "打开任务与轮询完成两条路都要带上下载名"
+
+
 def test_every_bound_element_id_exists_in_the_page() -> None:
     missing = sorted(set(BOUND_ID.findall(SCRIPT)) - set(DECLARED_ID.findall(PAGE)))
     assert not missing, f"script.js 绑定了页面里不存在的元素：{missing}"
