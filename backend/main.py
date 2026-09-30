@@ -45,6 +45,7 @@ class NoCacheStaticFiles(StaticFiles):
 from pydantic import BaseModel, Field, SecretStr
 
 from . import paraformer_asr, secret_box
+from . import asr_process
 from .config_store import BiliCredentialsUnavailable, LLM_KEYS_FILE, ConfigStore
 from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
@@ -265,6 +266,28 @@ paraformer_transcriber = ParaformerTranscriber(WHISPER_CACHE_DIR)
 
 
 async def run_transcription(
+    media_path: Path,
+    model_name: str,
+    use_gpu: bool,
+    title: str | None,
+    cancel_event: Any,
+    progress_callback: Any = None,
+) -> dict:
+    """转写入口：打包版交给工人子进程，源码版在原进程里跑。
+
+    CTranslate2 / sherpa-onnx 在打包环境里出过一次访问违例（崩的是整个进程，
+    托盘和界面一起没，日志一个字都没留下），所以正式产物里的转写必须死在外头。
+    """
+    if asr_process.use_child_process():
+        return await asr_process.run_in_child(
+            media_path, model_name, use_gpu, title, cancel_event, progress_callback
+        )
+    return await run_transcription_local(
+        media_path, model_name, use_gpu, title, cancel_event, progress_callback
+    )
+
+
+async def run_transcription_local(
     media_path: Path,
     model_name: str,
     use_gpu: bool,
