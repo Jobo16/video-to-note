@@ -406,6 +406,42 @@ def test_platform_403_maps_to_the_platform_of_the_task() -> None:
     )
 
 
+def test_context_limit_error_says_which_window_to_widen() -> None:
+    """回归：本地小模型（ollama 默认 num_ctx 只有 2048）跑长一点的视频时整条请求被通道拒掉，
+    原样透传的英文报错让用户以为「程序里有个 token 限制可以去调」。"""
+    for raw in (
+        # ollama：下发的输出额度超过模型窗口
+        "Error code: 400 - {'error': {'message': 'maximum context length is 2048 tokens, "
+        "however you requested 4600 tokens', 'type': 'invalid_request_error'}}",
+        # ollama / vLLM：提示词本身超窗，且带 OpenAI 系的错误码
+        "Error code: 400 - {'error': {'message': 'prompt has 5234 tokens which exceeds the "
+        "maximum context length (2048 tokens)', 'code': 'context_length_exceeded'}}",
+        # Anthropic 系说法
+        "Error code: 400 - {'error': {'message': 'prompt is too long: 200000 tokens > "
+        "100000 maximum'}}",
+        # 排序陷阱：这条含裸子串 "403"，若让权限分支先命中就成了「Key 没有该模型的权限」
+        "Error code: 400 - {'error': {'message': \"This model's maximum context length is "
+        '8192 tokens. However, you requested 9403 tokens\'}}',
+    ):
+        message = main.friendly_task_error(
+            raw, source=main.VideoSource.LOCAL, step_name=main.NOTE_STEP_NAME
+        )
+        assert "上下文窗口" in message and "num_ctx" in message, raw
+
+
+def test_rate_limit_is_not_reported_as_a_context_limit() -> None:
+    """OpenAI 限流的原文就是 `Too many tokens per minute`，按 token 字样判会把限流说成
+    窗口不够——照着提示去调 num_ctx 不会有任何改变（正是 1.4.0 修掉的那类张冠李戴）。"""
+    raw = (
+        "Error code: 429 - {'error': {'message': 'Too many tokens per minute, "
+        "please wait 10 seconds before trying again', 'type': 'rate_limit_exceeded'}}"
+    )
+    message = main.friendly_task_error(
+        raw, source=main.VideoSource.DOUYIN, step_name=main.NOTE_STEP_NAME
+    )
+    assert "限流" in message and "上下文" not in message
+
+
 def test_scrubbed_error_hides_keys_but_keeps_the_status() -> None:
     assert (
         main.scrub_technical_error("Error code: 403 with key sk-abcdef12345\n second line")

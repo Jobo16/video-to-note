@@ -2189,8 +2189,31 @@ def friendly_task_error(
     return message
 
 
+# 各家对"上下文窗口不够"的说法不一样（ollama 两种、OpenAI/vLLM 一种、LM Studio 一种），
+# 但都带这些字样。刻意不含 "too many tokens"：OpenAI 限流的原文就是
+# `Too many tokens per minute`，按它判会把限流说成窗口不够。
+_CONTEXT_LIMIT_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "num_ctx",
+    "maximum capacity of",
+)
+
+
 def friendly_llm_error(lowered: str, message: str) -> str:
     """生成笔记阶段的失败来自模型通道，重投视频链接不会有任何改变。"""
+    # 放在额度/429 之前：下面几条判的是裸子串 "429"/"403"，而本类报错里的数字是
+    # token 数（`requested 9403 tokens` 就含 "403"），先判会把窗口不够说成权限问题。
+    if any(marker in lowered for marker in _CONTEXT_LIMIT_MARKERS):
+        return (
+            "模型的上下文窗口装不下本次请求（这是模型侧的容量上限，不是本程序的笔记长度设置）。"
+            "本地模型（ollama / LM Studio / llama.cpp）请把上下文调到 16K 以上再重投："
+            "ollama 设 OLLAMA_CONTEXT_LENGTH=16384 后重启服务，或在 Modelfile 里写 "
+            "`num_ctx 16384`。在线通道多为该模型或网关的上限较低，"
+            "可换上下文更大的模型，或改用「精简摘要」减少单次送入的材料。"
+        )
     if "insufficient_quota" in lowered or "quota" in lowered or "余额" in message:
         return (
             "模型通道的额度或余额不足，笔记生成中断。"
