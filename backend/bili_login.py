@@ -27,6 +27,16 @@ SESSION_TTL_SECONDS = 300
 CDP_PORT_START = 9333
 CDP_PORT_COUNT = 10
 
+# urllib 在 Windows 上会读注册表里的系统代理（changelog/1.4.2.md 排查 500 悬案时
+# 就记了这条）。系统代理指向一个已经僵死的本地代理进程时，连 127.0.0.1 上的 CDP
+# 都会被劫走，扫码登录于是"永远等不到 cookie"。CDP 的 HTTP 调用一律走这条
+# 明确不挂任何代理的 opener。
+def _no_proxy_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+_CDP_OPENER = _no_proxy_opener()
+
 BROWSER_PATHS = [
     # Windows: Edge
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -50,13 +60,15 @@ def find_browser() -> str | None:
 
 def free_cdp_port() -> int | None:
     for port in range(CDP_PORT_START, CDP_PORT_START + CDP_PORT_COUNT):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
+        # socket() / setsockopt() 本身也可能抛（Winsock 被系统级问题拖垮时），
+        # 这里必须一起兜住：漏出去就是一次裸 500，而"没有可用端口"才是实情
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind(("127.0.0.1", port))
                 return port
-            except OSError:
-                continue
+        except OSError:
+            continue
     return None
 
 
@@ -260,7 +272,7 @@ class BiliLoginManager:
         if not session:
             return {}
         try:
-            with urllib.request.urlopen(
+            with _CDP_OPENER.open(
                 f"http://127.0.0.1:{session.cdp_port}/json/version", timeout=2
             ) as response:
                 version = json.loads(response.read().decode("utf-8"))
@@ -268,7 +280,8 @@ class BiliLoginManager:
             return {}
         cookies: list[dict[str, Any]] = []
         try:
-            async with websockets.connect(version["webSocketDebuggerUrl"]) as ws:
+            # websockets 14+ 默认跟随系统/环境代理；本机 CDP 的 ws 连接绝不能被代理劫走
+            async with websockets.connect(version["webSocketDebuggerUrl"], proxy=None) as ws:
                 await ws.send(json.dumps({"id": 1, "method": "Storage.getCookies"}))
                 while True:
                     message = json.loads(await asyncio.wait_for(ws.recv(), timeout=4))
@@ -309,11 +322,11 @@ class BiliLoginManager:
         process = session.process
         if process and process.poll() is None:
             try:
-                with urllib.request.urlopen(
+                with _CDP_OPENER.open(
                     f"http://127.0.0.1:{session.cdp_port}/json/version", timeout=2
                 ) as response:
                     version = json.loads(response.read().decode("utf-8"))
-                async with websockets.connect(version["webSocketDebuggerUrl"]) as ws:
+                async with websockets.connect(version["webSocketDebuggerUrl"], proxy=None) as ws:
                     await ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
                     await asyncio.sleep(0.3)
             except Exception:
