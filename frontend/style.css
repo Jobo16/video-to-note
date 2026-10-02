@@ -706,3 +706,19 @@ input[type="checkbox"] {
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* 本机自检报告（/api/diagnostics 的渲染出口）：等宽观感、可滚动、带复制按钮 */
+.diag-report {
+    display: block;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--border) 14%, transparent);
+    font-size: 12.5px;
+    line-height: 1.75;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 340px;
+    overflow: auto;
+}

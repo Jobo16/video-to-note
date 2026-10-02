@@ -77,10 +77,12 @@
             </label>
             <div class="llm-test-row">
                 <button id="llmTestBtn" class="button secondary" type="button">测试连接</button>
+                <button id="diagBtn" class="button ghost compact-button" type="button">本机自检</button>
                 <button id="saveKeyBtn" class="button ghost compact-button" type="button" disabled>保存到本机</button>
                 <button id="clearKeyBtn" class="button ghost compact-button" type="button" hidden>清除已存 Key</button>
             </div>
             <span id="llmTestStatus" class="llm-test-status" role="status" aria-live="polite"></span>
+            <div id="diagReport" class="diag-report" hidden></div>
 
             <div id="customApiConfig" class="custom-config" hidden>
                 <label id="customBaseUrlField" class="field" hidden>
@@ -401,6 +403,6 @@
 </div>
 
 <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-<script src="script.js?v=20260930-1"></script>
+<script src="script.js?v=20261003-1"></script>
 </body>
 </html>

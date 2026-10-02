@@ -8,12 +8,16 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -51,6 +55,8 @@ from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
     LLMSummarizer,
     default_base_url,
+    env_proxy_summary,
+    mask_proxy_target,
     normalize_endpoint_host,
     utf8_safe,
 )
@@ -212,6 +218,10 @@ class LocalSecurityMiddleware:
 app.add_middleware(LocalSecurityMiddleware)
 
 
+_STARTED_MONO = time.monotonic()
+_LAST_BACKEND_ERRORS: deque[str] = deque(maxlen=5)
+
+
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """没兜住的异常一律回 JSON，而不是 uvicorn 那句纯文本 Internal Server Error。
@@ -219,12 +229,19 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     前端 `extractErrorMessage` 只在响应是 JSON 时才取得到原因，裸 500 会退化成
     "测试请求失败（HTTP 500）"——群里报障时既分不清是后端崩了、还是端口被别的
     服务占着，也拿不到任何线索。traceback 由 Starlette 原样继续上抛，仍会进
-    `_app.log`，这里只负责把话说清楚。
+    `_app.log`；最近几条（脱敏后）留在 `_LAST_BACKEND_ERRORS`，`/api/diagnostics`
+    会带出来当悬案线索。
     """
-    reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+    try:
+        reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+        reason = redact_secrets(reason)
+        _LAST_BACKEND_ERRORS.append(f"{request.url.path}: {reason}")
+    except Exception:
+        # 兜错误的兜底自己也不能再炸：炸了就把话说到"有异常但构造不出说明"为止
+        reason = "后端内部错误（构造错误说明时又出了岔子，详情见本机 _app.log）"
     return JSONResponse(
         status_code=500,
-        content={"detail": f"后端内部错误：{redact_secrets(reason)}（详情见本机 _app.log）"},
+        content={"detail": f"后端内部错误：{reason}（详情见本机 _app.log）"},
     )
 
 
@@ -1194,6 +1211,13 @@ async def test_llm_connection(
         )
     except RuntimeError as error:
         return {"ok": False, "error": str(error)}
+    except Exception as error:
+        # 密钥档案读不了（磁盘被拖垮 / DPAPI 失灵 / 文件损坏）不该裸 500：
+        # 1.4.2 悬案里前端只剩「（HTTP 500）」，就是这类异常漏出去了
+        return {
+            "ok": False,
+            "error": utf8_safe(f"读取本机保存的 Key 失败：{type(error).__name__}: {error}"),
+        }
     try:
         summarizer = LLMSummarizer(
             model_type=model_type,
@@ -1211,7 +1235,7 @@ async def test_llm_connection(
             "key_source": key_source,
         }
     except Exception as exc:
-        return {"ok": False, "error": f"初始化失败：{exc}"}
+        return {"ok": False, "error": utf8_safe(f"初始化失败：{exc}")}
 
 
 @app.delete("/api/llm-config")
@@ -1344,6 +1368,199 @@ async def health_check() -> dict[str, Any]:
             "mcp_sse": MCP_SSE_ENABLED,
         },
     }
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _http_probe(url: str, timeout: float = 4.0, *, use_proxy: bool) -> dict[str, Any]:
+    """只看"HTTP 层有没有应答"的探测：任何状态码都算通，应答体截一小段当证据。"""
+    try:
+        if use_proxy:
+            opener = urllib.request.build_opener()
+        else:
+            # 本机回环与直连对照都必须绕开代理：urllib 在 Windows 会读注册表系统代理
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(url, headers={"User-Agent": "VideoToNo-diagnostics"})
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read(240)
+            return {
+                "ok": True,
+                "status": response.status,
+                "body": utf8_safe(body.decode("utf-8", "replace")),
+            }
+    except urllib.error.HTTPError as exc:
+        # 收得到状态码说明网络层是通的（403/404 也算）
+        return {"ok": True, "status": exc.code, "body": ""}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:200]}
+
+
+def _resolve_host(host: str) -> dict[str, Any]:
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:160]}
+    return {"ok": True, "addresses": sorted({info[4][0] for info in infos})[:3]}
+
+
+def _winsock_probe() -> dict[str, Any]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return {"ok": True, "port": sock.getsockname()[1]}
+    except OSError as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _wininet_proxy_snapshot() -> dict[str, Any]:
+    """Windows 注册表里的系统代理：浏览器和 urllib 认它，httpx 不认——分开报。"""
+    if os.name != "nt":
+        return {"available": False}
+    try:
+        import winreg
+    except ImportError:
+        return {"available": False}
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled = bool(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "")
+            try:
+                override = str(winreg.QueryValueEx(key, "ProxyOverride")[0] or "")
+            except FileNotFoundError:
+                override = ""
+    except FileNotFoundError:
+        return {"available": True, "enabled": False}
+    except OSError as exc:
+        return {"available": True, "error": utf8_safe(str(exc))[:120]}
+    if not enabled or not server:
+        return {"available": True, "enabled": False}
+    # ProxyServer 可能是 "host:port"，也可能按协议写成 "http=…;https=…"
+    target = server
+    if "=" in server:
+        for part in server.split(";"):
+            if part.lower().startswith(("https=", "http=")):
+                target = part.split("=", 1)[1]
+                break
+    host, _, port_text = target.rpartition(":")
+    port = int(port_text) if port_text.isdigit() else 80
+    return {
+        "available": True,
+        "enabled": True,
+        "server": mask_proxy_target(target),
+        "override": override[:160],
+        "listening": _tcp_reachable(host or target, port, 1.0),
+    }
+
+
+def _count_free_cdp_ports(start: int = 9333, count: int = 20) -> int:
+    free = 0
+    for port in range(start, start + count):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", port))
+                free += 1
+        except OSError:
+            continue
+    return free
+
+
+@app.get("/api/diagnostics")
+async def run_diagnostics(request: Request) -> dict[str, Any]:
+    """本机自检：现场回答"测试连接/扫码登录 500"这类悬案能查的问题。
+
+    只读、零密钥：响应里永远不出现 Key 明文、cookie、代理地址的账号段。
+    """
+    server_port = request.url.port or (request.scope.get("server") or (None, None))[1]
+    checks: dict[str, Any] = {}
+    hints: list[str] = []
+
+    checks["service"] = {
+        "pid": os.getpid(),
+        "version": app.version,
+        "mode": "portable" if getattr(sys, "frozen", False) else "dev",
+        "port": server_port,
+        "uptime_s": int(time.monotonic() - _STARTED_MONO),
+    }
+
+    loopback = await asyncio.wait_for(
+        asyncio.to_thread(
+            _http_probe, f"http://127.0.0.1:{server_port}/api/health", 3.0, use_proxy=False
+        ),
+        timeout=6,
+    )
+    identity = None
+    try:
+        identity = json.loads(str(loopback.get("body") or "null"))
+    except ValueError:
+        pass
+    is_ours = isinstance(identity, dict) and identity.get("service") == "VideoToNo"
+    checks["loopback_http"] = {**loopback, "is_ours": is_ours}
+    if loopback.get("ok") and not is_ours:
+        hints.append(
+            f"127.0.0.1:{server_port} 上应答的不是本程序（开头是：{str(loopback.get('body') or '')[:60]}）"
+            "——端口被别的软件占着，或本机代理在截本机请求"
+        )
+    elif not loopback.get("ok"):
+        hints.append("本机 HTTP 服务没答上话——后端可能刚被搞挂，看 workspace\\_app.log")
+
+    checks["winsock"] = await asyncio.to_thread(_winsock_probe)
+
+    registry = await asyncio.to_thread(_wininet_proxy_snapshot)
+    checks["system_proxy"] = {"env": env_proxy_summary(), "registry": registry}
+    if registry.get("enabled") and registry.get("listening") is False:
+        hints.append(
+            f"Windows 系统代理指向 {registry.get('server')}，但那个地址没有进程在听"
+            "——代理/加速器多半僵死了：关掉它或重启电脑，软件不用重装"
+        )
+
+    dns_checks = {
+        host: await asyncio.wait_for(asyncio.to_thread(_resolve_host, host), timeout=8)
+        for host in ("api.deepseek.com", "passport.bilibili.com")
+    }
+    checks["dns"] = dns_checks
+    if all(not entry.get("ok") for entry in dns_checks.values()):
+        hints.append("两个域名都解析失败——DNS 或网络本身有问题：换手机热点试一次，不行再重启电脑")
+
+    direct = await asyncio.wait_for(
+        asyncio.to_thread(_http_probe, "https://api.deepseek.com", 5.0, use_proxy=False),
+        timeout=9,
+    )
+    via_proxy = await asyncio.wait_for(
+        asyncio.to_thread(_http_probe, "https://api.deepseek.com", 5.0, use_proxy=True),
+        timeout=9,
+    )
+    checks["outbound"] = {"direct": direct, "with_system_proxy": via_proxy}
+    if direct.get("ok") and not via_proxy.get("ok"):
+        hints.append("直连通、带系统代理出不去——就是本机代理/加速器的问题，关掉它即可，不用重启电脑")
+    if not direct.get("ok"):
+        hints.append("不走代理也出不去——到 api.deepseek.com 整条路不通（网卡/防火墙/驱动）；重启电脑仍不行就换网络")
+
+    checks["cdp_ports_free"] = await asyncio.to_thread(_count_free_cdp_ports)
+    try:
+        checks["llm_key_storage"] = {
+            "backend": secret_box.storage_backend(),
+            "corrupt": bool(config_store.keys_are_corrupt()),
+        }
+    except Exception as exc:
+        checks["llm_key_storage"] = {"error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:120]}
+
+    recent = list(_LAST_BACKEND_ERRORS)
+    checks["recent_backend_errors"] = recent
+    if recent:
+        hints.append("后端近期抛过未兜住的异常（见 recent_backend_errors，对照 _app.log 的 Traceback）")
+
+    if not hints:
+        hints.append("各项自检没发现异常——把这份报告整段发给作者/群里，比一句 500 有用得多")
+    return {"ok": True, "checks": checks, "hints": hints}
 
 
 @app.post("/api/bili-login/start")

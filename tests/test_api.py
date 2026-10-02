@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import time
+import urllib.request
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import launcher
-from backend import main
+from backend import bili_login, douyin_login, main
 from backend.config_store import BILI_CREDENTIALS_FILE, ConfigStore
 from backend.llm_summarizer import LLMSummarizer, utf8_safe
 from backend.transcript import TranscriptSegment
@@ -2194,6 +2195,118 @@ def test_llm_test_survives_lone_surrogate_in_model_reply(
     body = response.json()
     assert body["ok"] is True
     assert LONE_SURROGATE not in body["message"]
+
+
+def test_llm_test_reports_unreadable_key_store_without_http_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """密钥档案读不了（磁盘被拖垮 / DPAPI 失灵 / 文件损坏）要回可读错误，不能裸 500。
+
+    1.4.2 悬案里前端只剩「（HTTP 500）」，就是这类异常从 except RuntimeError 的
+    缝隙漏出去的结果。
+    """
+
+    def boom(*args, **kwargs):
+        raise OSError("模拟磁盘被拖垮")
+
+    monkeypatch.setattr(main, "resolve_llm_credentials", boom)
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/llm-test", json={"model_type": "deepseek"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "读取本机保存的 Key 失败" in body["error"]
+    assert "OSError" in body["error"]
+
+
+# --------------------------------------------------------------------------- 本机自检（1.4.2 悬案的取证出口）
+
+
+def test_diagnostics_reports_probe_results_without_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/api/diagnostics 的探测全部可注入；报告里永远没有密钥与代理账号段。"""
+
+    def fake_probe(url: str, timeout: float = 4.0, *, use_proxy: bool) -> dict:
+        if "127.0.0.1" in url:
+            return {"ok": True, "status": 200, "body": json.dumps({"service": "VideoToNo"})}
+        return {"ok": True, "status": 200, "body": ""}
+
+    monkeypatch.setattr(main, "_http_probe", fake_probe)
+    monkeypatch.setattr(main, "_resolve_host", lambda host: {"ok": True, "addresses": ["203.0.113.7"]})
+    monkeypatch.setattr(main, "_wininet_proxy_snapshot", lambda: {"available": False})
+    monkeypatch.setattr(main, "_count_free_cdp_ports", lambda start=9333, count=20: 20)
+    monkeypatch.setattr(main, "config_store", ConfigStore(tmp_path))
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:supersecret@127.0.0.1:7890")
+
+    response = TestClient(main.app).get("/api/diagnostics")
+
+    assert response.status_code == 200
+    body = response.json()
+    checks = body["checks"]
+    assert body["ok"] is True
+    assert checks["loopback_http"]["is_ours"] is True
+    assert checks["service"]["version"] == main.app.version
+    assert checks["cdp_ports_free"] == 20
+    assert checks["dns"]["api.deepseek.com"]["ok"] is True
+    assert checks["outbound"]["direct"]["ok"] is True
+    assert "***@127.0.0.1:7890" in checks["system_proxy"]["env"]
+    assert "supersecret" not in response.text
+    assert body["hints"]
+
+
+def test_unhandled_error_handler_survives_redaction_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """兜底处理器里的脱敏再炸，也要回得出 JSON——兜错误的地方不能自己再崩。"""
+
+    class Boom:
+        def keys_are_corrupt(self):
+            raise RuntimeError("boom")
+
+    def exploding_redact(text):
+        raise RuntimeError("脱敏炸了")
+
+    monkeypatch.setattr(main, "redact_secrets", exploding_redact)
+    monkeypatch.setattr(main, "config_store", Boom())
+    response = TestClient(main.app, raise_server_exceptions=False).get("/api/llm-keys")
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert "后端内部错误" in response.json()["detail"]
+
+
+def test_free_cdp_port_survives_winsock_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Winsock 被系统级问题拖垮时返回"没有可用端口"，而不是把裸 OSError 漏成 500。"""
+
+    def boom(*args, **kwargs):
+        raise OSError("Winsock 不可用")
+
+    for module in (bili_login, douyin_login):
+        monkeypatch.setattr(module.socket, "socket", boom)
+        assert module.free_cdp_port() is None
+
+
+def test_cdp_openers_bypass_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """urllib 在 Windows 会读注册表系统代理；CDP 的 opener 必须显式不挂任何代理。
+
+    空 ProxyHandler 不贡献任何方法，不会留在 handlers 里——所以这里把
+    getproxies 投毒后重新构建一次：默认 opener 会把毒代理吃进去，显式空代理的
+    构建方式则无论 handlers 里有没有 ProxyHandler，代理表都是空的。
+    """
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://127.0.0.1:9"})
+    for module in (bili_login, douyin_login):
+        opener = module._no_proxy_opener()
+        proxy_handlers = [
+            handler
+            for handler in opener.handlers
+            if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        assert all(handler.proxies == {} for handler in proxy_handlers)
 
 
 def test_unhandled_backend_error_comes_back_as_json(

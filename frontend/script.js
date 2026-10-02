@@ -286,6 +286,7 @@ function bindEvents() {
     bindListener('renameProfileBtn', 'click', handleProfileRenameClick);
     bindListener('llmModel', 'change', handleModelChange);
     bindListener('llmTestBtn', 'click', testLlmConnection);
+    bindListener('diagBtn', 'click', runDiagnostics);
     bindListener('saveKeyBtn', 'click', saveApiKey);
     bindListener('clearKeyBtn', 'click', clearSavedKey);
     bindListener('customProfileAddBtn', 'click', addCustomProfile);
@@ -2941,7 +2942,15 @@ function escapeHtml(value) {
 }
 
 async function readResponse(response, fallbackMessage) {
-    if (!response.ok) throw new Error(await extractErrorMessage(response, fallbackMessage));
+    if (!response.ok) {
+        const message = await extractErrorMessage(response, fallbackMessage);
+        // 裸 5xx（连 detail 都取不到）是 1.4.2 那批悬案的同款症状：应答的可能根本
+        // 不是本程序。自动补一次本机探测，把"端口被占/服务没答话"当场说清。
+        if (response.status >= 500 && message.endsWith(`（HTTP ${response.status}）`)) {
+            throw new Error(await probeLocalService(message));
+        }
+        throw new Error(message);
+    }
     try {
         return await response.json();
     } catch {
@@ -2969,6 +2978,103 @@ async function extractErrorMessage(response, fallbackMessage) {
     } catch {
         return `${fallbackMessage}（HTTP ${response.status}）`;
     }
+}
+
+let lastLocalProbeAt = 0;
+
+async function probeLocalService(baseMessage) {
+    const now = Date.now();
+    if (now - lastLocalProbeAt < 8000) return baseMessage; // 轮询类调用别反复体检
+    lastLocalProbeAt = now;
+    const verdict = await probeHealth();
+    return `${baseMessage}。自检：${verdict}`;
+}
+
+async function probeHealth() {
+    try {
+        const response = await fetchWithTimeout(`${API_BASE}/health`, {}, 2500);
+        const data = await response.json().catch(() => null);
+        if (data && data.service === 'VideoToNo') {
+            return '本机服务在答话，但刚才那个 5xx 的响应体不是它发的 JSON，多半是后端内部崩了'
+                + '（详情在 workspace\\_app.log；可点「本机自检」看完整报告）';
+        }
+        if (data) {
+            return `这个端口的应答不是 VideoToNo（${JSON.stringify(data).slice(0, 80)}）`
+                + '——端口被别的程序占着，托盘退出重开试试';
+        }
+        return '应答不是 JSON——端口八成被别的程序占了，托盘退出重开试试';
+    } catch {
+        return '本机服务没在答话——托盘可能已退出：右键托盘退出后重开，无效再重启电脑';
+    }
+}
+
+async function runDiagnostics() {
+    const button = byId('diagBtn');
+    const report = byId('diagReport');
+    button.disabled = true;
+    button.textContent = '自检中…';
+    report.hidden = false;
+    report.textContent = '正在自检（本机端口 / 系统代理 / DNS / 直连对比，约几秒）…';
+    try {
+        const [healthVerdict, payload] = await Promise.all([
+            probeHealth(),
+            fetchWithTimeout(`${API_BASE}/diagnostics`, {}, 20000)
+                .then((response) => readResponse(response, '自检请求失败'))
+                .catch((error) => ({ ok: false, error: error.message })),
+        ]);
+        renderDiagnostics(report, payload, healthVerdict);
+    } finally {
+        button.disabled = false;
+        button.textContent = '本机自检';
+    }
+}
+
+function formatDiagnosticsText(payload, healthVerdict) {
+    const lines = [];
+    if (payload && payload.ok) {
+        const checks = payload.checks || {};
+        const service = checks.service || {};
+        lines.push(`服务：VideoToNo v${service.version}（PID ${service.pid}，端口 ${service.port}，已运行 ${service.uptime_s} 秒）`);
+        const loopback = checks.loopback_http || {};
+        lines.push(`本机应答：${loopback.ok
+            ? `HTTP ${loopback.status}，${loopback.is_ours ? '是本程序' : '不是本程序！'}`
+            : `无应答（${loopback.error || '未知'}）`}`);
+        const winsock = checks.winsock || {};
+        lines.push(`Winsock：${winsock.ok ? `正常（试绑端口 ${winsock.port}）` : `异常（${winsock.error}）`}`);
+        const proxy = checks.system_proxy || {};
+        const registry = proxy.registry || {};
+        lines.push(`系统代理：环境变量 ${proxy.env || '无'}；Windows 注册表 ${registry.available
+            ? (registry.enabled
+                ? `已启用 ${registry.server}${registry.listening === false ? '（那个端口上没有进程在听！）' : ''}`
+                : '未启用')
+            : '读不到'}`);
+        Object.entries(checks.dns || {}).forEach(([host, entry]) => {
+            lines.push(`DNS ${host}：${entry.ok ? entry.addresses.join(' / ') : `失败（${entry.error}）`}`);
+        });
+        const describe = (probe) => (probe && probe.ok ? `通（HTTP ${probe.status}）` : `不通（${(probe && probe.error) || '未知'}）`);
+        const outbound = checks.outbound || {};
+        lines.push(`直连 api.deepseek.com：${describe(outbound.direct)}`);
+        lines.push(`走系统代理：${describe(outbound.with_system_proxy)}`);
+        lines.push(`扫码登录可用调试端口：${checks.cdp_ports_free} 个`);
+        (payload.hints || []).forEach((hint) => lines.push(`→ ${hint}`));
+    } else {
+        lines.push(`自检请求失败：${(payload && payload.error) || '未知原因'}`);
+        lines.push(`本机探测：${healthVerdict}`);
+    }
+    return lines.join('\n');
+}
+
+function renderDiagnostics(report, payload, healthVerdict) {
+    report.textContent = formatDiagnosticsText(payload, healthVerdict);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'button ghost compact-button';
+    copy.textContent = '复制报告';
+    copy.addEventListener('click', () => {
+        copyTextToClipboard(report.textContent, '自检报告已复制');
+    });
+    report.appendChild(document.createElement('br'));
+    report.appendChild(copy);
 }
 
 function showToast(message, type = 'info') {
