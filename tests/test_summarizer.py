@@ -16,6 +16,7 @@ from backend.llm_summarizer import (
     TAIL_PATCH_MAX_INPUT_CHARACTERS,
     LLMSummarizer,
     PROVIDER_DEFAULTS,
+    mask_proxy_target,
 )
 from backend.transcript import TranscriptSegment, segments_to_prompt
 
@@ -1718,3 +1719,157 @@ async def test_dropped_stream_with_partial_content_is_not_retried() -> None:
     with pytest.raises(RuntimeError, match="peer closed"):
         await summarizer._complete("测试", 800, "high")
     assert summarizer.warnings == []
+
+
+# ------------------------------------------------- 测试连接的绕代理重试（1.4.2「重启电脑才行」悬案的对症路）
+
+
+def test_mask_proxy_target_hides_userinfo() -> None:
+    """诊断信息允许出现"代理指向哪"，绝不允许带出代理的账号段。"""
+    assert mask_proxy_target("http://user:supersecret@127.0.0.1:7890") == "http://***@127.0.0.1:7890"
+    assert mask_proxy_target("socks5://127.0.0.1:7891") == "socks5://127.0.0.1:7891"
+    assert mask_proxy_target("") == ""
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _connection_error():
+    import httpx
+    import openai
+
+    return openai.APIConnectionError(request=httpx.Request("POST", "https://api.example.test/v1"))
+
+
+@pytest.mark.asyncio
+async def test_test_connection_retries_direct_when_env_proxy_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """走环境代理连不上时自动直连重试；两条路都要在消息里说清。"""
+    attempts: list[str] = []
+    created: list[str] = []
+
+    class FakeCompletions:
+        def __init__(self, tag: str) -> None:
+            self._tag = tag
+
+        async def create(self, **kwargs):
+            attempts.append(self._tag)
+            if self._tag == "proxied":
+                raise _connection_error()
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))]
+            )
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            tag = "direct" if created else "proxied"
+            created.append(tag)
+            self.chat = SimpleNamespace(completions=FakeCompletions(tag))
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, message, _latency = await summarizer.test_connection()
+
+    assert ok is True
+    assert attempts == ["proxied", "direct"]
+    assert "直连成功" in message
+    assert "HTTPS_PROXY=" in message
+
+
+@pytest.mark.asyncio
+async def test_test_connection_direct_retry_also_failing_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """绕开代理也连不上时，把"整条网络都不通"说出口，别只报代理。"""
+    attempts: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            attempts.append(1)
+            raise _connection_error()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(attempts) == 2
+    assert "绕开代理直连也一样失败" in message
+
+
+@pytest.mark.asyncio
+async def test_test_connection_skips_retry_without_env_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有环境代理就没有"换条路"可言：失败直接返回，不建第二个客户端。"""
+    created: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            raise _connection_error()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            created.append(1)
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, _message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_test_connection_does_not_retry_on_auth_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """401 这类与代理无关的失败不再重试，免得把"Key 不对"搅成网络问题。"""
+    attempts: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            attempts.append(1)
+            raise RuntimeError("HTTP 401")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, _message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(attempts) == 1

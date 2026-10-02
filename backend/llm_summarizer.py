@@ -6,6 +6,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
@@ -239,6 +240,47 @@ def _rejected_params_from_env() -> set[str]:
         if name.strip() in REASONING_PARAM_NAMES
     }
 
+_PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
+def mask_proxy_target(value: str) -> str:
+    """把代理地址里的账号段打码（http://user:pass@host:port → http://***@host:port）。
+
+    诊断信息里允许出现"代理指向哪里"，但绝不允许把代理凭据带出去。
+    """
+    text = str(value or "").strip()
+    if "@" not in text:
+        return text[:120]
+    scheme, sep, rest = text.partition("://")
+    head = f"{scheme}://" if sep else ""
+    host = rest.rsplit("@", 1)[-1]
+    return f"{head}***@{host}"[:120]
+
+
+def env_proxy_summary() -> str | None:
+    """环境变量里配置的出站代理（打码后）；没有则 None。
+
+    httpx（openai SDK 底层）只认这一份代理配置；Windows 注册表里的系统代理
+    影响的是浏览器与 urllib。分开看才说得清"请求到底走的哪条路"。
+    """
+    for name in _PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if value:
+            return f"{name}={mask_proxy_target(value)}"
+    return None
+
+
+def _is_connect_failure(exc: Exception | None) -> bool:
+    """只有"连不上"这一类失败才值得绕代理重试；401/404 与代理无关。"""
+    if exc is None:
+        return False
+    try:
+        from openai import APIConnectionError
+    except ImportError:
+        return False
+    return isinstance(exc, APIConnectionError)  # APITimeoutError 是它的子类
+
+
 ProgressCallback = Callable[[int, str], Awaitable[None] | None]
 
 
@@ -275,6 +317,7 @@ class LLMSummarizer:
             timeout=LLM_TIMEOUT_SECONDS,
             max_retries=LLM_MAX_RETRIES,
         )
+        self._api_key = api_key  # 直连重试要重建客户端；任何日志/响应出口统一脱敏
         self.model_type = model_type
         self.base_url = base_url or ""
         self.model = model
@@ -283,12 +326,41 @@ class LLMSummarizer:
         # 同进程内后续任务不会再重复踩同一个 400
 
     async def test_connection(self, timeout_seconds: float = 20.0) -> tuple[bool, str, float]:
-        """轻量连通性测试：发一个极小请求，返回 (是否成功, 可读消息, 耗时秒)。"""
-        import time
+        """轻量连通性测试：发一个极小请求，返回 (是否成功, 可读消息, 耗时秒)。
 
+        带环境代理的失败会用"不走代理"的直连再试一次：1.4.2 群里那批"只有重启
+        电脑才好"的故障，最像代理/加速器把出站请求带进僵死状态——直连通了就把
+        结论说给用户（关代理即可），别让人重启电脑碰运气。
+        """
+        start = time.monotonic()
+        ok, message, latency, failure = await self._ping(self.client, timeout_seconds)
+        proxy_in_env = env_proxy_summary()
+        if ok or proxy_in_env is None or not _is_connect_failure(failure):
+            return ok, utf8_safe(message), latency
+        bare, bare_http = self._direct_client(timeout_seconds)
+        if bare is None:
+            return False, utf8_safe(message), latency
+        try:
+            direct_ok, direct_message, direct_latency, _ = await self._ping(bare, timeout_seconds)
+        finally:
+            with suppress(Exception):
+                await bare.close()
+            with suppress(Exception):
+                await bare_http.aclose()
+        if direct_ok:
+            return True, (
+                f"{direct_message}（不走系统代理直连成功；走 {proxy_in_env} 的请求失败：{message}）"
+                "——本机代理/加速器大概率僵死了，关掉它即可，不用重启电脑"
+            ), direct_latency
+        return False, (
+            f"{message}；绕开代理直连也一样失败：{direct_message}"
+            "——到该地址的整条网络都不通，先关代理/加速器试一次，不行再重启电脑"
+        ), direct_latency
+
+    async def _ping(self, client: Any, timeout_seconds: float) -> tuple[bool, str, float, Exception | None]:
         start = time.monotonic()
         try:
-            response = await self.client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=8,
@@ -297,11 +369,27 @@ class LLMSummarizer:
             latency = time.monotonic() - start
             reply = utf8_safe(response.choices[0].message.content or "").strip()
             if reply:
-                return True, f"连接成功（{latency * 1000:.0f} ms）模型响应：{reply[:40]}", latency
-            return True, f"连接成功（{latency * 1000:.0f} ms）", latency
+                return True, f"连接成功（{latency * 1000:.0f} ms）模型响应：{reply[:40]}", latency, None
+            return True, f"连接成功（{latency * 1000:.0f} ms）", latency, None
         except Exception as exc:
             latency = time.monotonic() - start
-            return False, self._describe_llm_error(exc, latency), latency
+            return False, self._describe_llm_error(exc, latency), latency, exc
+
+    def _direct_client(self, timeout_seconds: float) -> tuple[Any | None, Any | None]:
+        """绕开环境代理的临时客户端；依赖缺失时返回 (None, None)，退回原失败文案。"""
+        try:
+            import httpx
+            from openai import AsyncOpenAI
+        except ImportError:
+            return None, None
+        http = httpx.AsyncClient(trust_env=False, timeout=timeout_seconds)
+        client = AsyncOpenAI(
+            api_key=self._api_key,
+            base_url=self.base_url or None,
+            http_client=http,
+            max_retries=0,
+        )
+        return client, http
 
     @staticmethod
     def _describe_llm_error(exc: Exception, latency: float) -> str:
