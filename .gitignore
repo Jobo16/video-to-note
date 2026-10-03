@@ -43,3 +43,8 @@ Thumbs.db
 /harmonyos/
 /scripts/read_bili_cookie.py
 /.hvigor/
+
+# 一次排查留下的路径清单转储（仓库内无引用，本地保留）
+/sopath.txt
+# ZCode 的索引排除清单（本机工具配置，勿提交）
+/.zcodeignore
