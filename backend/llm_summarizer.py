@@ -127,6 +127,18 @@ SECTION_TOKENS_PER_CHARACTER = 1.6
 SECTION_TOKEN_KEEP_RATIO = 0.8
 SECTION_MAX_TOKENS_MIN = 1_200
 SECTION_MAX_TOKENS_MAX = 5_000
+# 分片压缩与分层归并这两次「整理」请求的输出额度：按材料净字数估正文需要多少，
+# 再加一份思考链预留。旧值是恒定 1200 / 1400，同时犯了两错——
+# ① 一个 9000 预算的块里真语音从 1700 字到 9000 字都有（whisper 碎段把预算吃在时间戳
+#    开销上），恒定额度对大块不够、对小块过宽；
+# ② 1200 连思考链都装不下：ollama 上 gemma 实测一次压缩请求思考 4505 字 / 正文 0 /
+#    finish_reason=length，整条任务死在 10%（该通道不响应关思考，见 _apply_reasoning
+#    对 custom 的处理——我们没有任何把手）。
+# 额度只是油箱容量不是油门（见 MAX_EFFORT_BUDGET_MULTIPLIER 那条注释），用不满不加成本。
+NOTE_BUDGET_KEEP_RATIO = 0.45
+NOTE_BUDGET_THINKING_RESERVE_TOKENS = 1_500
+NOTE_BUDGET_MAX_TOKENS_MIN = 1_600
+NOTE_BUDGET_MAX_TOKENS_MAX = 5_000
 # 每段最多尝试次数（首次 + 重试一次）与段内续写次数。
 SECTION_ATTEMPTS = 2
 SECTION_CONTINUATION_MAX = 3
@@ -565,17 +577,29 @@ class LLMSummarizer:
                     chunk_progress,
                     chunk_stage,
                 )
-                condensed_chunks.append(
-                    await self._complete(
-                        self._chunk_prompt(title, index, len(chunks), chunk),
-                        max_tokens=1_200,
-                        effort=notes_effort,
-                        progress_callback=progress_callback,
-                        progress=chunk_progress,
-                        stage=chunk_stage,
-                        should_abort=should_abort,
+                try:
+                    condensed_chunks.append(
+                        await self._complete(
+                            self._chunk_prompt(title, index, len(chunks), chunk),
+                            max_tokens=self._note_budget_max_tokens(
+                                sum(len(segment.text) for segment in chunk)
+                            ),
+                            effort=notes_effort,
+                            progress_callback=progress_callback,
+                            progress=chunk_progress,
+                            stage=chunk_stage,
+                            should_abort=should_abort,
+                        )
                     )
-                )
+                except Exception as exc:
+                    # 一次压缩失败不该判死整条任务：这一块的原文直接当作片段材料往下走，
+                    # 内容一条不丢，只是成稿读到的是转录而不是压缩稿。
+                    # CancelledError 不是 Exception 子类，用户取消照样原样往外抛。
+                    self.warnings.append(
+                        f"第 {index}/{len(chunks)} 个转录片段未能整理"
+                        f"（{type(exc).__name__}: {exc}），已把该片段原文交给后续成稿"
+                    )
+                    condensed_chunks.append(segments_to_prompt(chunk))
             await self._report_progress(
                 progress_callback, 60, f"已整理 {len(chunks)} 个转录片段"
             )
@@ -892,6 +916,17 @@ class LLMSummarizer:
         return max(SECTION_MAX_TOKENS_MIN, min(SECTION_MAX_TOKENS_MAX, estimate))
 
     @staticmethod
+    def _note_budget_max_tokens(characters: int) -> int:
+        """「整理」类请求（分片压缩、分层归并）的输出额度：正文需要 + 思考链预留。
+
+        入参是材料的净字数。字/token 沿用 ``SECTION_TOKENS_PER_CHARACTER`` 那一套口径；
+        保留率比逐段直写低（0.45 vs 0.8），因为这一层的产物只是给成稿用的中间材料。
+        """
+        content = int(characters / SECTION_TOKENS_PER_CHARACTER * NOTE_BUDGET_KEEP_RATIO)
+        estimate = content + NOTE_BUDGET_THINKING_RESERVE_TOKENS
+        return max(NOTE_BUDGET_MAX_TOKENS_MIN, min(NOTE_BUDGET_MAX_TOKENS_MAX, estimate))
+
+    @staticmethod
     def _context_tail(sections: Sequence[Sequence[TranscriptSegment]], index: int) -> str:
         """上一段结尾的原话，只用来让模型看懂「接着上面那道题」这类指代。
 
@@ -1086,17 +1121,30 @@ class LLMSummarizer:
                     merge_progress,
                     merge_stage,
                 )
-                merged.append(
-                    await self._complete(
-                        self._merge_prompt(title, level, index, len(groups), group),
-                        max_tokens=1_400,
-                        effort=self._stage_effort(reasoning_effort, style, "notes"),
-                        progress_callback=progress_callback,
-                        progress=merge_progress,
-                        stage=merge_stage,
-                        should_abort=should_abort,
+                try:
+                    merged.append(
+                        await self._complete(
+                            self._merge_prompt(title, level, index, len(groups), group),
+                            max_tokens=self._note_budget_max_tokens(
+                                sum(len(note) for note in group)
+                            ),
+                            effort=self._stage_effort(reasoning_effort, style, "notes"),
+                            progress_callback=progress_callback,
+                            progress=merge_progress,
+                            stage=merge_stage,
+                            should_abort=should_abort,
+                        )
                     )
-                )
+                except Exception as exc:
+                    # 归并失败就停在当前层，把这一层的材料原样交给成稿：成稿读到的材料
+                    # 比 ``MERGE_INPUT_CHARACTERS`` 预算大，但内容一条不丢，也不会让
+                    # 已经写了大半的任务死在归并上。不保留半截 ``merged``——同一批 notes
+                    # 必须来自同一层，混层会让材料密度前后不一致。
+                    self.warnings.append(
+                        f"第 {level} 层内容归并失败（{type(exc).__name__}: {exc}），"
+                        "已停止归并，未归并的片段笔记直接交给成稿"
+                    )
+                    return notes
             notes = merged
         return notes
 

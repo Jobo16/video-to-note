@@ -7,6 +7,8 @@ import pytest
 from backend.llm_summarizer import (
     LLM_MAX_RETRIES,
     LLM_TIMEOUT_SECONDS,
+    NOTE_BUDGET_MAX_TOKENS_MAX,
+    NOTE_BUDGET_MAX_TOKENS_MIN,
     NOTE_SECTION_CHARACTERS,
     NOTE_TAIL_CHARACTERS,
     SECTION_MAX_TOKENS_MAX,
@@ -521,6 +523,98 @@ async def test_below_threshold_still_uses_hierarchical_reduction() -> None:
     assert not any("这是全片第" in prompt for prompt in calls)
     assert progress == sorted(progress)
     assert progress[-1] == 99
+
+
+def test_note_budget_scales_with_material_and_keeps_thinking_room() -> None:
+    """回归（ollama gemma 用户 40 分钟视频实测）：恒定 1200 的压缩额度连思考链都装不下
+    ——一次请求思考 4505 字 / 正文 0 / finish_reason=length，整条任务死在 10%。"""
+    # 最坏情况：一个 9000 预算的块里只有约 1700 字真语音（whisper 碎段把预算吃在时间戳上）
+    assert LLMSummarizer._note_budget_max_tokens(1_700) > 1_200
+    # 大块给更多额度，不再"对大块不够、对小块过宽"
+    assert LLMSummarizer._note_budget_max_tokens(9_000) > (
+        LLMSummarizer._note_budget_max_tokens(1_700)
+    )
+    assert LLMSummarizer._note_budget_max_tokens(0) == NOTE_BUDGET_MAX_TOKENS_MIN
+    assert LLMSummarizer._note_budget_max_tokens(40_000) == NOTE_BUDGET_MAX_TOKENS_MAX
+
+
+@pytest.mark.asyncio
+async def test_chunk_compression_failure_falls_back_to_the_raw_transcript() -> None:
+    """一次分片压缩失败不该判死整条任务：该块原文直接交给成稿，内容一条不丢。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        if "这是第" in prompt and "个连续片段" in prompt:
+            if "第 1/3 个连续片段" in prompt:
+                raise RuntimeError("模型未返回正文（下发 max_tokens=1200、思考档=off）")
+            return "压缩稿"
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    result = await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert result == "# 视频笔记"
+    draft_prompt = next(prompt for prompt in prompts if "材料：" in prompt)
+    assert "第0段" in draft_prompt, "失败那一段的原文必须仍然交给成稿"
+    assert "压缩稿" in draft_prompt, "其余片段照常使用压缩结果"
+    assert any("未能整理" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_chunk_compression_cancellation_still_propagates() -> None:
+    """兜底是 ``except Exception``：用户取消（BaseException）必须原样抛出去，
+    否则会变成"取消不掉"，后台还在继续砸请求。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise asyncio.CancelledError("任务已取消")
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    with pytest.raises(asyncio.CancelledError):
+        await summarizer.generate_summary("标题", segments, style="faithful")
+
+
+@pytest.mark.asyncio
+async def test_reduce_failure_stops_at_the_current_level() -> None:
+    """归并失败就停在当前层，把未归并的片段笔记交给成稿，而不是让写了大半的任务死掉。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        if "这是第" in prompt and "个连续片段" in prompt:
+            return "片段材料" * 1_500  # 三份 6000 字，归并一定会触发
+        if "这是长视频内容的第" in prompt:
+            raise RuntimeError("模型未返回正文")
+        return "# 长视频笔记"
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    result = await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert result == "# 长视频笔记"
+    draft_prompt = next(prompt for prompt in prompts if "材料：" in prompt)
+    assert "片段材料" in draft_prompt
+    assert any("已停止归并" in warning for warning in summarizer.warnings)
 
 
 _SECTION_RANGE_RE = re.compile(r"覆盖时间轴 (\S+?) – (\S+?)。")
