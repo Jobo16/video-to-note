@@ -1,7 +1,7 @@
 <p align="center">
   <img src="sources/icon.png" width="96" alt="VideoToNo 图标">
 </p>
-<h1 align="center">VideoToNo v1.4.3</h1>
+<h1 align="center">VideoToNo v1.4.5</h1>
 
 <p align="center"><em>把视频变成可回看的 Markdown 笔记</em></p>
 
@@ -17,7 +17,7 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 
 > 🤖 **Agent Skill 已上线**：把仓库里的 `skills/video-to-note/` 目录复制到 agent 的技能目录（如 `C:/Users/用户名/.agents/skills/`），即可让 Claude Code、pi 等直接一句话生成视频笔记。详见该目录下的 `SKILL.md`。
 
-## 🆕 What's New（v1.4.2 → v1.4.3）
+## 🆕 What's New（v1.4.2 → v1.4.5）
 
 - **长视频和本地小模型更容易一次跑完**：中间任何一次模型请求被拒，以前是整条任务失败、写好的东西全丢；现在只跳过那一小段，原文照样留在笔记里。ollama 这类本地模型跑长视频的成功率明显变好
 - **报错会告诉你该动哪里**：小模型跑长视频撞上的「token 超限」，现在直说是模型上下文窗口不够、以及怎么调大；也不会再让你去改一个改了没用的档位
@@ -66,7 +66,7 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 
 ## 🚀 便携版下载（推荐）
 
-普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.3-portable.exe`：
+普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.5-portable.exe`：
 
 1. 下载并双击 exe；
 2. 等待浏览器自动打开本地页面；

@@ -2,7 +2,7 @@
   <img src="sources/icon.png" width="96" alt="VideoToNo icon">
 </p>
 
-<h1 align="center">VideoToNo v1.4.3</h1>
+<h1 align="center">VideoToNo v1.4.5</h1>
 
 <p align="center"><em>Turn videos into Markdown notes you can revisit</em></p>
 
@@ -18,7 +18,7 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 > 🤖 **Agent Skill available**: copy the `skills/video-to-note/` directory from this repo into your agent's skills directory (e.g. `~/.agents/skills/`) and coding agents like Claude Code or pi can generate video notes from a single sentence. See `SKILL.md` inside that directory.
 
-## 🆕 What's New (v1.4.2 → v1.4.3)
+## 🆕 What's New (v1.4.2 → v1.4.5)
 
 - **Long videos and small local models finish in one run far more often**: when any single model request was rejected the whole task used to fail and everything already written was lost; now just that stretch is skipped and its original text stays in the note. Local models such as ollama succeed much more often on long videos
 - **Errors say what to change**: the "token limit" hit when a small model runs a long video is now plainly the model's context window being too small, with the way to widen it — you won't be sent to change a setting that does nothing on that channel
@@ -65,7 +65,7 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 ## 🚀 Portable build (recommended)
 
-No Python or development setup is required. Download `VideoToNo-1.4.3-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
+No Python or development setup is required. Download `VideoToNo-1.4.5-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
 
 1. Download and double-click the exe;
 2. Wait for the local page to open in your browser;
