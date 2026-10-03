@@ -590,8 +590,13 @@ def test_archive_note_deduplicates_names(monkeypatch, tmp_path) -> None:
 def test_archive_note_ignored_by_task_discovery(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
     main.archive_note("某个视频", "# 笔记")
+    main.archive_note("某个视频【转录】", "# 转录", folder=main.TRANSCRIPTS_DIR_NAME)
 
     assert main.find_reusable_task("https://www.bilibili.com/video/BV1xx") is None
+    # 两个归档目录都不带 task.json，重启恢复时不能被当成任务
+    main.restore_tasks_from_workspace()
+    assert main.NOTES_DIR_NAME not in main.tasks
+    assert main.TRANSCRIPTS_DIR_NAME not in main.tasks
 
 
 def test_download_returns_markdown_file(
@@ -1328,6 +1333,76 @@ async def test_local_task_title_uses_uploaded_filename(
     assert finished["status"] == "completed"
     assert finished["result"]["title"] == "课程 第一讲"
     assert any("标题：课程 第一讲" in log for log in finished["logs"])
+
+
+@pytest.mark.asyncio
+async def test_transcript_only_task_archives_a_titled_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归（群测原话"现在都叫 transcript.md"）：纯转录只在 `workspace/<UUID>/` 里留一个
+    固定名文件，而那个 UUID 目录是工作目录（音频与 task.json 都在里面），不该是用户
+    要拿的产物。产物落到 `workspace/transcripts/`，名字与下载名同一个来源。"""
+    task_id = "transcript-archive"
+    media = tmp_path / task_id / "input.mp4"
+    media.parent.mkdir()
+    media.write_bytes(b"bits")
+
+    class FakeProcessor:
+        @staticmethod
+        def detect_source(*args, **kwargs):
+            return main.VideoSource.LOCAL
+
+        @staticmethod
+        async def get_video_info(url_or_path, cookie=None, allow_local=False, notes=None):
+            return {"title": Path(url_or_path).stem, "source": "local", "duration": 12}
+
+        @staticmethod
+        async def cleanup(value):
+            return None
+
+    class FakeTranscriber:
+        @staticmethod
+        async def transcribe(
+            media_path,
+            model,
+            use_gpu,
+            initial_prompt=None,
+            cancel_event=None,
+            progress_callback=None,
+        ):
+            return {
+                "segments": [
+                    TranscriptSegment(0, 12, "这是一段用来通过文字质量检查的本地视频口播内容")
+                ],
+                "language": "zh",
+                "model": model,
+                "requested_model": model,
+                "device": "cpu",
+                "duration": 12,
+            }
+
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "video_processor", FakeProcessor())
+    monkeypatch.setattr(main, "transcriber", FakeTranscriber())
+    task = main.new_task(status="uploaded", task_id=task_id)
+    task.update(uploaded_file_path=str(media), uploaded_filename="课程 第一讲.mp4")
+    main.tasks[task_id] = task
+
+    await main.process_video_task(
+        task_id,
+        main.SummarizeRequest(
+            video_url=str(media), output="transcript", llm_config=main.LLMConfig()
+        ),
+    )
+
+    finished = main.tasks[task_id]
+    assert finished["status"] == "completed"
+    archived = Path(finished["result"]["archived_path"])
+    assert archived.parent == tmp_path / main.TRANSCRIPTS_DIR_NAME
+    assert archived.name == "课程 第一讲【转录】.md"
+    assert "口播内容" in archived.read_text(encoding="utf-8")
+    # 工作目录里那份照旧留着：音频、transcript.json 与它都在，排查时还要用
+    assert (tmp_path / task_id / "transcript.md").is_file()
 
 
 @pytest.mark.asyncio

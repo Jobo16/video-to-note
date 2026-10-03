@@ -90,6 +90,10 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 WHISPER_CACHE_DIR = Path(
     os.getenv("WHISPER_CACHE_DIR", str(WORKSPACE_DIR / "_model_cache"))
 ).resolve()
+# workspace/ 下两个面向人的产物目录。转录稿单独一个目录而不是混进 notes/：先转写、后生成
+# 笔记的同一视频会各留一份，分开摆一眼看得清，不用靠【转录】后缀在一堆文件里认。
+NOTES_DIR_NAME = "notes"
+TRANSCRIPTS_DIR_NAME = "transcripts"
 FRONTEND_DIR = BASE_DIR / "frontend"
 APP_ICON_PATH = BASE_DIR / "sources" / "icon.png"
 FAVICON_PATH = BASE_DIR / "sources" / "icon.ico"
@@ -2166,6 +2170,25 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             # 正文只留在 transcript.json / transcript.md：result 会被 wait_for_task
             # 每 2 秒轮询一次并由 persist_task_runtime 反复落盘，不能放大文本
             elapsed = finish_task_timing(task)
+            # 归档读的是刚落盘的那份 transcript.md（与下载端点同一个文件），不在这里
+            # 重新拼一遍格式——两处各拼一次迟早会对不上。
+            try:
+                transcript_markdown = (
+                    WORKSPACE_DIR / task_id / "transcript.md"
+                ).read_text(encoding="utf-8")
+            except OSError:
+                transcript_markdown = ""
+            archived_path = (
+                archive_note(
+                    download_stem(title, info, "transcript"),
+                    transcript_markdown,
+                    folder=TRANSCRIPTS_DIR_NAME,
+                )
+                if transcript_markdown
+                else None
+            )
+            if archived_path:
+                task["logs"].append(f"转录稿已归档：{archived_path}")
             task["result"] = {
                 "title": title,
                 "output": "transcript",
@@ -2177,6 +2200,7 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                 "transcript_language": transcript_result["language"],
                 "transcript_quality": quality,
                 "output_directory": str(WORKSPACE_DIR / task_id),
+                "archived_path": str(archived_path) if archived_path else None,
                 "processing_seconds": elapsed,
             }
             task.update(
@@ -2657,24 +2681,31 @@ def rewrite_note_image_refs(content: str, prefix: str) -> str:
     )
 
 
-def archive_note(title: str, content: str, task_id: str | None = None) -> Path | None:
-    """把笔记归档到 workspace/notes/ 下（按下载名落盘，重名自动加序号），便于集中回顾。
+def archive_note(
+    title: str,
+    content: str,
+    task_id: str | None = None,
+    folder: str = NOTES_DIR_NAME,
+) -> Path | None:
+    """把产物按标题命名归档到 workspace/<folder>/ 下（重名自动加序号），便于集中回顾。
 
-    截图不复制：归档在 notes/ 下，与任务目录同在 workspace/ 里，引用改写成
+    默认 notes/；纯转录走 transcripts/，与笔记分开摆。
+
+    截图不复制：归档在 workspace/ 的子目录下，与任务目录同级，引用改写成
     ../<task_id>/frames/ 就能就地看图，代价是删掉任务后归档里的图失效。
 
     返回归档路径；写入失败时返回 None（不影响任务本身）。
     """
-    notes_root = WORKSPACE_DIR / "notes"
+    archive_root = WORKSPACE_DIR / folder
     if task_id:
         content = rewrite_note_image_refs(content, f"../{task_id}/")
     try:
-        notes_root.mkdir(parents=True, exist_ok=True)
+        archive_root.mkdir(parents=True, exist_ok=True)
         safe = _safe_filename(title)
-        candidate = notes_root / f"{safe}.md"
+        candidate = archive_root / f"{safe}.md"
         index = 2
         while candidate.exists():
-            candidate = notes_root / f"{safe}-{index}.md"
+            candidate = archive_root / f"{safe}-{index}.md"
             index += 1
         candidate.write_text(content, encoding="utf-8")
         return candidate
