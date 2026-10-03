@@ -77,6 +77,14 @@ DEEPSEEK_HIGH_TOKEN_BUDGET = 12_000
 # 正文一个字没拿到，靠关思考重试才救回）。×5 给思考留出收尾余地，正常产出规模
 # 仍由各阶段的 max_tokens 把住。
 MAX_EFFORT_BUDGET_MULTIPLIER = 5
+# 观测到某条通道确实在返回思考链之后，给它后续每次请求的输出额度补一份思考预留。
+# 靠实测而不是猜档位：ollama / vLLM / 各种免费兼容网关上我们对思考没有任何把手
+# （``_apply_reasoning`` 对 custom 什么都不下发），链长只能由模型决定，而思考链计入
+# 输出 token——额度不够时挤掉的是正文（用户实测：一次压缩请求思考 4505 字 / 正文 0）。
+# 同一进程内按 (provider, model, base_url) 记住，第一次请求之后就会自动放宽。
+# DeepSeek 兼容通道不走这里，它已有 MAX_EFFORT_BUDGET_MULTIPLIER 那套膨胀机制。
+THINKING_RESERVE_TOKENS = 2_000
+_THINKING_SEEN_CHANNELS: set[tuple[str, str, str]] = set()
 # auto 档在 DeepSeek 兼容通道的默认推理档位：一律关闭思考。
 # 累计六次实测：max 思考要么吃满输出额度正文为 0（28 分钟视频思考 2.2 万字后正文 0），
 # 要么拖到十几分钟被网关掐断长流（昇腾通道 peer closed）；high 仍有万字号思考；而 off
@@ -92,7 +100,6 @@ SECTION_EFFORT = "off"
 TAIL_GAP_SECONDS = 60.0
 # 补尾时附带给模型参考的已有笔记结尾长度。
 NOTE_TAIL_CHARACTERS = 600
-TAIL_PATCH_MAX_TOKENS = 1_600
 # 补写结尾的三道护栏。成稿提示词明确允许“不必每段都加时间戳”，所以“笔记末尾时间戳
 # 落后于转写结尾”既可能是真的丢尾，也可能只是省略了时间戳。不加护栏时，后者会把
 # 整段剩余转录塞进一次 max 思考档的补写请求（几十分钟无任何进度反馈，表现为“卡住不动”，
@@ -560,9 +567,19 @@ class LLMSummarizer:
 
         继续服务 concise，以及净字数不超过 ``LONG_TRANSCRIPT_CHARACTERS`` 的短片——这个规模
         下逐段压缩后的总量本来就小于 ``MERGE_INPUT_CHARACTERS``，归并根本不会触发，实测质量
-        与排版都良好（37 分钟用户重测通过），所以不拿已验证的行为去换未验证的路径。
+        与排版都良好（37 分钟用户重测通过）。**分流阈值**仍守着"不拿已验证的行为去换未验证
+        的路径"；改的是切块之前先合并碎行——不合并时 32 字/段的时间戳开销会把中短视频也切成
+        好几块，每块都押一次有损压缩调用。
         """
-        chunks = chunk_segments(segments, max_characters=SUMMARY_CHUNK_CHARACTERS)
+        # 先把碎 ASR 行拼成长行再切块。不合并的话每段都要摊上 32 字时间戳开销，
+        # whisper 碎到平均 7.5 字一段时开销吃掉 81% 的预算——7 分钟的视频也会被切成
+        # 好几块，每块多一次有损压缩调用，而每一次都是"通道在思考就把整条任务押上"的
+        # 赌注（ollama gemma 用户实测：40 分钟切成 4 块，一次压缩被思考吃满即整条判死）。
+        # 合并只作用于喂给模型的提示词，落盘的 transcript.md 仍是逐句粒度。
+        chunks = chunk_segments(
+            merge_segment_lines(segments, SECTION_LINE_MERGE_CHARACTERS),
+            max_characters=SUMMARY_CHUNK_CHARACTERS,
+        )
         if len(chunks) == 1:
             source = segments_to_prompt(chunks[0])
         else:
@@ -1233,7 +1250,9 @@ class LLMSummarizer:
                     self._tail_patch_prompt(
                         title, draft, material, missing_start, format_timestamp(coverage_end)
                     ),
-                    max_tokens=TAIL_PATCH_MAX_TOKENS,
+                    max_tokens=self._note_budget_max_tokens(
+                        sum(len(segment.text) for segment in material)
+                    ),
                     effort=effort,
                     progress_callback=progress_callback,
                     progress=88,
@@ -1248,6 +1267,17 @@ class LLMSummarizer:
                 "（模型响应过慢，可降低推理强度后重新生成）"
             )
             await self._report_progress(progress_callback, 91, "补写结尾超时，已保留原笔记")
+            return draft
+        except Exception as exc:
+            # 补写只是"把结尾再往前推一点"的可选增强，它失败绝不能推翻已经写完整的笔记。
+            # 以前只 catch TimeoutError，一次「模型未返回正文」会把 78% 处已成稿的任务
+            # 判死——用户实测：18 分钟视频「详细复原」失败、「精简摘要」通过，差别正是
+            # concise 在函数开头就跳过了补写。
+            # CancelledError 不是 Exception 子类，用户取消照样原样往外抛。
+            self.warnings.append(
+                f"补写结尾失败（{type(exc).__name__}: {exc}），已跳过并保留原笔记"
+            )
+            await self._report_progress(progress_callback, 91, "补写结尾失败，已保留原笔记")
             return draft
         return f"{draft.rstrip()}\n\n### 补遗（{missing_start} 之后）\n\n{patch.strip()}"
 
@@ -1370,6 +1400,23 @@ class LLMSummarizer:
             self._rejected_params = cached
         return cached
 
+    @property
+    def thinking_seen(self) -> bool:
+        """这条配置是否已实测到模型在返回思考链（同一进程内按配置共用）。"""
+        return self._param_cache_key() in _THINKING_SEEN_CHANNELS
+
+    def _controls_thinking(self) -> bool:
+        """本程序是否知道怎么在这条通道上开关思考。
+
+        不知道就别劝用户去改档位：custom / ollama 上换档既不会下发任何思考参数，也不会
+        改变 ``_build_request`` 的额度（它的膨胀条件是 DeepSeek 兼容），照做只会原地重投。
+        """
+        return self._uses_deepseek_compatibility() or self.model_type in {
+            "glm",
+            "qwen",
+            "openai",
+        }
+
     def _build_request(
         self, prompt: str, max_tokens: int, effort: str, budget: str = "auto"
     ) -> dict[str, Any]:
@@ -1403,6 +1450,10 @@ class LLMSummarizer:
             if self._uses_deepseek_compatibility() and effort != "off"
             else max_tokens
         )
+        if self.thinking_seen and not self._uses_deepseek_compatibility():
+            # 实测到这条通道在返回思考链，就把预留加在最终额度上，而不是去改各阶段传进来的
+            # max_tokens——那个值表达的是"正文要写多长"，语义不该被通道行为污染。
+            thinking_budget += THINKING_RESERVE_TOKENS
         if budget != "omit":
             request[token_key] = thinking_budget if budget == "auto" else max_tokens
         self._apply_reasoning(request, effort)
@@ -1527,11 +1578,20 @@ class LLMSummarizer:
         # 把"我们下发了什么"与"通道实际给了什么"并排记下来：静默忽略关思考请求、或把
         # max_tokens 悄悄砍小，都不会回 400，参数降级阶梯因此永远不触发，光看
         # finish_reason=length 猜不到额度是谁缩的。
+        if reasoning_characters:
+            # 收到过思考增量就是实测证据：本进程内这条通道后续每次请求都自动补一份
+            # 思考预留（见 _build_request）。第一次可能仍然不够，但不会一直不够。
+            _THINKING_SEEN_CHANNELS.add(self._param_cache_key())
         if effort == "off" and reasoning_characters:
             # 不带阶段名与字数：这是通道级的事实，一次任务说一句就够（逐段直写会调几十次）
+            hint = (
+                "可在界面上改选「高」或「最大」档"
+                if self._controls_thinking()
+                else "本程序对这条通道没有思考开关，改档位也不会变"
+            )
             self._warn_once(
                 "该通道没有响应「关闭深度思考」的请求，仍在返回思考链；"
-                "这类通道上正文偏长时容易被思考吃满输出额度，可在界面上改选「高」或「最大」档"
+                f"这类通道上正文偏长时容易被思考吃满输出额度，{hint}。"
             )
         if not content:
             outcome = (
@@ -1561,7 +1621,13 @@ class LLMSummarizer:
             # 已经关过思考却仍只收到思考 ⇒ 这条通道不认我们的关闭请求，再劝"关闭深度
             # 思考"就是把人往死胡同里带（1.4.2 群测实测：off 档下发后仍累计 6473 字
             # 思考、4600 额度吃满，正文一个字没出）。
-            if effort == "off":
+            if not self._controls_thinking():
+                # custom / ollama：换档位既不下发思考参数也不改变额度，劝人改档等于骗他重投
+                advice = (
+                    "本程序没有这条通道的思考开关，思考链只能占正文的额度，改推理档位不会"
+                    "有任何变化；可改用「精简摘要」、缩短视频，或换一个输出额度更大的模型。"
+                )
+            elif effort == "off":
                 advice = (
                     "该通道没有响应关思考的请求，请改用「高」或「最大」档给正文留出额度，"
                     "或缩短转录、更换模型。"

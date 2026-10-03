@@ -14,6 +14,7 @@ from backend.llm_summarizer import (
     SECTION_MAX_TOKENS_MAX,
     SECTION_MAX_TOKENS_MIN,
     SECTION_WRITE_CONCURRENCY,
+    THINKING_RESERVE_TOKENS,
     TAIL_PATCH_MAX_GAP_SECONDS,
     TAIL_PATCH_MAX_INPUT_CHARACTERS,
     LLMSummarizer,
@@ -38,6 +39,20 @@ def _stream_response(
         )
 
     return gen()
+
+
+@pytest.fixture(autouse=True)
+def isolate_channel_caches(monkeypatch):
+    """两条模块级通道缓存按生产语义会一直存活，测试里必须各自从空集开始。
+
+    否则用例结果取决于执行顺序：前一个用例让某条配置"实测到过思考链"，后一个用例的
+    额度就凭空多出预留（``_THINKING_SEEN_CHANNELS``），或被记走一个思考参数
+    （``_REJECTED_REASONING_PARAMS``）。
+    """
+    from backend import llm_summarizer as module
+
+    monkeypatch.setattr(module, "_REJECTED_REASONING_PARAMS", {})
+    monkeypatch.setattr(module, "_THINKING_SEEN_CHANNELS", set())
 
 
 def test_note_prompt_forbids_invented_timestamps() -> None:
@@ -1967,3 +1982,145 @@ async def test_test_connection_does_not_retry_on_auth_error(
 
     assert ok is False
     assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# 思考链吃满输出额度（本地 ollama 用户 2026-10-03 的实测日志：一次压缩请求
+# 思考 4505 字 / 正文 0 / finish_reason=length，整条任务死在 10%）
+# ---------------------------------------------------------------------------
+
+
+def _ollama_like(model: str = "gemma4:e4b") -> LLMSummarizer:
+    """一条"本程序没有思考开关"的通道：custom + 非 DeepSeek 模型名 + 本机地址。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.model_type = "custom"
+    summarizer.model = model
+    summarizer.base_url = "http://127.0.0.1:11434/v1"
+    summarizer.warnings = []
+    return summarizer
+
+
+def _fake_client(summarizer: LLMSummarizer, create) -> None:
+    summarizer.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+
+def test_reserve_waits_for_evidence_and_never_overrides_degradation() -> None:
+    from backend import llm_summarizer as module
+
+    summarizer = _ollama_like()
+    assert not summarizer._controls_thinking()
+    assert summarizer._build_request("p", 1_600, "auto")["max_tokens"] == 1_600
+    # 换档对这条通道既不下发思考参数也不改变额度——所以失败文案不该劝人换档
+    assert summarizer._build_request("p", 1_600, "high")["max_tokens"] == 1_600
+
+    module._THINKING_SEEN_CHANNELS.add(summarizer._param_cache_key())
+    assert summarizer._build_request("p", 1_600, "auto")["max_tokens"] == (
+        1_600 + THINKING_RESERVE_TOKENS
+    )
+    # 降级到 requested 时不叠加预留：那条路正是网关嫌额度太大才退回来的
+    assert summarizer._build_request("p", 1_600, "auto", budget="requested")["max_tokens"] == 1_600
+
+
+@pytest.mark.asyncio
+async def test_stream_records_that_the_channel_actually_thinks() -> None:
+    async def create(**kwargs):
+        return _stream_response("正文", reasoning="思考" * 100)
+
+    summarizer = _ollama_like()
+    _fake_client(summarizer, create)
+
+    assert not summarizer.thinking_seen
+    assert await summarizer._complete("测试", 1_600, "off") == "正文"
+    assert summarizer.thinking_seen
+    assert any("改档位也不会变" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_empty_content_advice_stops_offering_a_no_op_knob() -> None:
+    """回归：1.4.2 那句"请改用「高」或「最大」档"是给 DeepSeek 兼容通道写的，
+    在 ollama 上换档既不下发思考参数也不抬高额度，照做只会原地重投。"""
+
+    async def create(**kwargs):
+        return _stream_response(None, "length", reasoning="思考" * 2_000)
+
+    summarizer = _ollama_like()
+    _fake_client(summarizer, create)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await summarizer._complete("测试", 1_200, "off")
+
+    assert "没有这条通道的思考开关" in str(excinfo.value)
+    assert "请改用「高」" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tail_patch_failure_keeps_the_finished_draft() -> None:
+    """补写只是可选增强：只 catch TimeoutError 时，一次「模型未返回正文」会把已经
+    写完整的笔记一起判死。用户实测同一 18 分钟视频「详细复原」失败、「精简摘要」通过，
+    差别正是 concise 在函数开头就跳过了补写。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise RuntimeError("模型未返回正文（下发 max_tokens=1600、思考档=off）")
+
+    summarizer._complete = complete
+    # 缺口 299 秒：在 TAIL_PATCH_MAX_GAP_SECONDS 之内，确实会发出补写请求
+    segments = [
+        TranscriptSegment(index * 60.0, index * 60.0 + 59.0, f"第{index}段内容")
+        for index in range(8)
+    ]
+    draft = "## 小节 [00:00-02:00]\n\n已经写好的正文"
+
+    result = await summarizer._ensure_tail_coverage(
+        "标题", draft, segments, "faithful", "off", None, None
+    )
+
+    assert result == draft
+    assert any("补写结尾失败" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_tail_patch_cancellation_still_propagates() -> None:
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise asyncio.CancelledError("任务已取消")
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index * 60.0, index * 60.0 + 59.0, f"第{index}段内容")
+        for index in range(8)
+    ]
+
+    with pytest.raises(asyncio.CancelledError):
+        await summarizer._ensure_tail_coverage(
+            "标题", "## 小节 [00:00-02:00]\n\n正文", segments, "faithful", "off", None, None
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_transcript_is_not_split_by_timestamp_overhead() -> None:
+    """碎 ASR 行的时间戳开销曾把 7 分钟的视频切成多块，每块都要押一次有损压缩调用。
+    先合并成 ~48 字长行再切，这个规模就该是一次成稿、零压缩调用。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    # 300 段 × 8 字：净字数只有 2400，但逐行摊上 32 字开销就是 12000，超过 9000 预算
+    segments = [
+        TranscriptSegment(index * 1.5, index * 1.5 + 1.4, "字" * 8) for index in range(300)
+    ]
+
+    await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert not any("个连续片段" in prompt for prompt in prompts), "不该再发分片压缩请求"
+    assert len(prompts) == 1
