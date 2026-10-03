@@ -2309,6 +2309,45 @@ def test_cdp_openers_bypass_system_proxy(monkeypatch: pytest.MonkeyPatch) -> Non
         assert all(handler.proxies == {} for handler in proxy_handlers)
 
 
+def test_update_check_endpoint_reports_newer_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """启动自检的更新端点：新版本在场时给全 tag/地址/节选，交前端弹窗。"""
+    monkeypatch.setattr(
+        main.update_check,
+        "fetch_latest_release",
+        lambda current, timeout=5.0: {
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/example/release",
+            "update_available": True,
+            "notes": "修复若干",
+        },
+    )
+    response = TestClient(main.app).get("/api/update/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["update_available"] is True
+    assert body["latest_version"] == "v9.9.9"
+    assert body["current_version"] == main.app.version
+    assert body["release_url"] == "https://github.com/example/release"
+    assert body["notes"] == "修复若干"
+
+
+def test_update_check_endpoint_survives_github_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitHub 连不上时回 200 + ok=False，前端静默，不当成错误打扰用户。"""
+
+    def boom(current, timeout=5.0):
+        raise OSError("网络不通")
+
+    monkeypatch.setattr(main.update_check, "fetch_latest_release", boom)
+    response = TestClient(main.app).get("/api/update/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "OSError" in body["error"]
+
+
 def test_unhandled_backend_error_comes_back_as_json(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:

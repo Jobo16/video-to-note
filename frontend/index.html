@@ -402,7 +402,19 @@
     </main>
 </div>
 
+<div id="updateModal" class="modal-backdrop" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="updateTitle">
+        <h3 id="updateTitle">发现新版本</h3>
+        <p id="updateBody" class="update-body"></p>
+        <div class="modal-actions">
+            <button id="updateAcceptBtn" class="button" type="button">确定更新</button>
+            <button id="updateIgnoreBtn" class="button ghost" type="button">忽略本次更新</button>
+            <button id="updateCancelBtn" class="button ghost" type="button">取消</button>
+        </div>
+    </div>
+</div>
+
 <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-<script src="script.js?v=20261003-1"></script>
+<script src="script.js?v=20261003-2"></script>
 </body>
 </html>

@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from . import paraformer_asr, secret_box
 from . import asr_process
+from . import update_check
 from .config_store import BiliCredentialsUnavailable, LLM_KEYS_FILE, ConfigStore
 from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
@@ -1368,6 +1369,16 @@ async def health_check() -> dict[str, Any]:
             "mcp_sse": MCP_SSE_ENABLED,
         },
     }
+
+
+@app.get("/api/update/check")
+async def check_app_update() -> dict[str, Any]:
+    """启动自检用：对比 GitHub 最新 Release；连不上也回 200，前端静默不提示。
+
+    这里故意沿用系统代理的默认行为（与 CDP 那两处相反）：GitHub 恰恰是
+    常需要代理才够得着的地址，代理在场就该用。
+    """
+    return await asyncio.to_thread(update_check.check_summary, app.version)
 
 
 def _tcp_reachable(host: str, port: int, timeout: float = 1.0) -> bool:

@@ -153,6 +153,8 @@ document.addEventListener('DOMContentLoaded', () => {
     safeStep(applyMcpAccess, '初始化 MCP 接入信息');
     loadAppVersion();
     loadRecentTasks(true);
+    // 启动自检更新：晚几秒再发，别跟首屏请求抢路；失败静默，托盘里有手动入口
+    window.setTimeout(runStartupUpdateCheck, 2500);
     window.__videoToNoReady = true;
 });
 
@@ -287,6 +289,9 @@ function bindEvents() {
     bindListener('llmModel', 'change', handleModelChange);
     bindListener('llmTestBtn', 'click', testLlmConnection);
     bindListener('diagBtn', 'click', runDiagnostics);
+    bindListener('updateAcceptBtn', 'click', acceptUpdateOffer);
+    bindListener('updateIgnoreBtn', 'click', ignoreUpdateOffer);
+    bindListener('updateCancelBtn', 'click', dismissUpdateOffer);
     bindListener('saveKeyBtn', 'click', saveApiKey);
     bindListener('clearKeyBtn', 'click', clearSavedKey);
     bindListener('customProfileAddBtn', 'click', addCustomProfile);
@@ -600,7 +605,8 @@ function defaultPrefs() {
             processing_mode: 'restart',
             output_mode: 'note'
         },
-        ui: { theme: 'system', mcp_hint_seen: false }
+        ui: { theme: 'system', mcp_hint_seen: false },
+        update: { ignored_version: '' }
     };
 }
 
@@ -3075,6 +3081,46 @@ function renderDiagnostics(report, payload, healthVerdict) {
     });
     report.appendChild(document.createElement('br'));
     report.appendChild(copy);
+}
+
+let updateOffer = null;
+
+async function runStartupUpdateCheck() {
+    try {
+        const response = await fetchWithTimeout(`${API_BASE}/update/check`, {}, 10000);
+        const data = await readResponse(response, '检查更新失败');
+        if (!data.ok || !data.update_available) return;
+        const ignored = (prefs.update && prefs.update.ignored_version) || '';
+        if (ignored && ignored === data.latest_version) return;
+        updateOffer = data;
+        const notes = data.notes ? data.notes.trim().slice(0, 300) : '';
+        byId('updateBody').textContent = `发现新版本 ${data.latest_version}（当前 v${data.current_version}）。`
+            + (notes ? `\n\n更新内容（节选）：\n${notes}` : '')
+            + '\n\n确定更新会打开 GitHub 发布页，下载后替换本程序即可。';
+        byId('updateModal').hidden = false;
+    } catch {
+        // 启动自检失败不打扰：网络常态问题，托盘菜单里随时可以手动检查
+    }
+}
+
+function acceptUpdateOffer() {
+    byId('updateModal').hidden = true;
+    if (updateOffer && updateOffer.release_url) {
+        window.open(updateOffer.release_url, '_blank', 'noopener');
+    }
+}
+
+function ignoreUpdateOffer() {
+    if (updateOffer && updateOffer.latest_version) {
+        prefs.update = prefs.update || {};
+        prefs.update.ignored_version = updateOffer.latest_version;
+        schedulePersist(persistPrefs);
+    }
+    byId('updateModal').hidden = true;
+}
+
+function dismissUpdateOffer() {
+    byId('updateModal').hidden = true;
 }
 
 function showToast(message, type = 'info') {
