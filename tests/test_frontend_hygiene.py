@@ -69,6 +69,19 @@ def test_browser_side_downloads_are_named_after_the_note() -> None:
     assert SCRIPT.count("task.download_name") == 2, "打开任务与轮询完成两条路都要带上下载名"
 
 
+def test_completed_notice_leads_with_the_titled_file() -> None:
+    """群测原话"能不能用视频标题命名，现在都叫 transcript.md"——根因不是命名没做，是主行
+    摆的是 UUID 任务目录，用户点进去只看到固定名的中间产物，于是以为那就是产物名。
+
+    有归档时主行必须是带标题的归档文件；任务目录降成补充信息（音频与抽帧在里面，不能不告诉
+    用户），归档失败时退回原样。
+    """
+    body = SCRIPT.split("async function showResult(", 1)[1].split("\n}\n", 1)[0]
+    assert "archivedPath || outputDirectory" in body, "主行没优先取归档文件"
+    assert "taskDirNotice" in body, "任务目录被整条删掉了（音频与抽帧在里面）"
+    assert "outputPathLabel" in body, "主行换了含义，引导语必须跟着变，否则读起来是错的"
+
+
 def test_every_bound_element_id_exists_in_the_page() -> None:
     missing = sorted(set(BOUND_ID.findall(SCRIPT)) - set(DECLARED_ID.findall(PAGE)))
     assert not missing, f"script.js 绑定了页面里不存在的元素：{missing}"

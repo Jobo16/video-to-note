@@ -2300,6 +2300,7 @@ function resetTaskView() {
     byId('regenerateBtn').disabled = true;
     byId('outputNotice').hidden = true;
     byId('outputPath').textContent = '';
+    byId('taskDirPath').textContent = '';
     renderTaskAdvisory(null);
     byId('networkState').textContent = '准备提交';
     byId('networkState').classList.remove('network-warning');
@@ -2543,13 +2544,18 @@ async function showResult(result) {
     const outputDirectory = typeof result.output_directory === 'string'
         ? result.output_directory.trim()
         : '';
-    byId('outputPath').textContent = outputDirectory;
-    byId('outputNotice').hidden = !outputDirectory;
     const archivedPath = typeof result.archived_path === 'string'
         ? result.archived_path.trim()
         : '';
-    byId('archivedPath').textContent = archivedPath;
-    byId('archivedNotice').hidden = !archivedPath;
+    // 主行放"该拿的那一份"。归档文件名带视频标题，任务目录是一串 UUID 加固定名的中间
+    // 产物（notes.md / transcript.md）——把后者摆在主行，用户会以为产物就叫 transcript.md
+    // （群测原话），而下载和归档早就按标题命名了。
+    const primaryPath = archivedPath || outputDirectory;
+    byId('outputPathLabel').textContent = archivedPath ? '已保存到' : '输出文件已保存在';
+    byId('outputPath').textContent = primaryPath;
+    byId('outputNotice').hidden = !primaryPath;
+    byId('taskDirPath').textContent = outputDirectory;
+    byId('taskDirNotice').hidden = !(archivedPath && outputDirectory);
     return true;
 }
 
