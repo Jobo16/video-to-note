@@ -679,7 +679,8 @@ def test_section_stage_effort_disables_thinking_in_auto_mode() -> None:
 
     # 逐段直写是局部任务：实测 high 档每段 1 万多字思考只换 1 千字正文，auto 下直接关思考
     assert summarizer._stage_effort("auto", "faithful", "section") == "off"
-    assert summarizer._stage_effort("auto", "faithful", "notes") == "off"
+    # 而中短路径的压缩与成稿走 STYLE_DEFAULT_EFFORT（2026-10-03 三档对照后从 off 换成 high）
+    assert summarizer._stage_effort("auto", "faithful", "notes") == "high"
     # 用户显式选择仍然优先
     assert summarizer._stage_effort("max", "faithful", "section") == "max"
     assert summarizer._stage_effort("off", "faithful", "section") == "off"
@@ -710,7 +711,7 @@ async def test_long_transcript_writes_sections_without_merging() -> None:
     assert "这份笔记覆盖四段内容。" in result
     # 目录由代码生成：区间端点必须落在整片时间轴上
     toc = result.split("## 本片目录")[1].split("## 小节")[0]
-    assert "`00:00 –" in toc and "写到结尾" in result.split("## 小节4")[1]
+    assert "`00:00-" in toc and "写到结尾" in result.split("## 小节4")[1]
     assert progress == sorted(progress)
     assert progress[-1] == 99
 
@@ -1069,8 +1070,9 @@ async def test_explicit_effort_is_respected_by_mechanical_stages() -> None:
     ]
     # 4 次段内续写 + 1 次概览
     assert len(mechanical) == 5
-    # 用户显式选了档位，机械阶段也照它的选择下发
-    assert set(mechanical) == {"max"}
+    # 用户显式选了档位，机械阶段也照它的选择下发；而「最大」在入口就被折成「高」
+    # （界面上已去掉这一档，实测它对笔记是净伤害），所以这里收到的是 high 不是 max
+    assert set(mechanical) == {"high"}
 
 
 @pytest.mark.asyncio
@@ -1531,24 +1533,62 @@ def test_auto_resolves_style_default_only_on_deepseek_compatible_channels() -> N
     summarizer.model_type = "deepseek"
     summarizer.model = "deepseek-v4-flash"
     summarizer.base_url = "https://api.deepseek.com"
-    assert summarizer._stage_effort("auto", "detailed", "notes") == "off"
-    assert summarizer._stage_effort("auto", "faithful", "notes") == "off"
-    assert summarizer._stage_effort("auto", "concise", "notes") == "off"
+    assert summarizer._stage_effort("auto", "detailed", "notes") == "high"
+    assert summarizer._stage_effort("auto", "faithful", "notes") == "high"
+    assert summarizer._stage_effort("auto", "concise", "notes") == "high"
     # 用户显式选择永远优先
     assert summarizer._stage_effort("off", "detailed", "notes") == "off"
     assert summarizer._stage_effort("high", "detailed", "analysis") == "high"
 
-    # custom 通道识别出 DeepSeek 模型时同样吃到风格默认
+    # custom 通道识别出 DeepSeek 模型时同样吃到风格默认（所以默认换成 high 也覆盖到
+    # ModelScope 这类免费代理——那条通道有长思考流被掐断的旧记录，是这次改动的已知风险）
     summarizer.model_type = "custom"
     summarizer.model = "deepseek-ai/DeepSeek-V4-Flash-0731"
     summarizer.base_url = "https://api-inference.modelscope.cn/v1/"
-    assert summarizer._stage_effort("auto", "detailed", "notes") == "off"
+    assert summarizer._stage_effort("auto", "detailed", "notes") == "high"
 
     # 非 DeepSeek 通道保持模型默认，不注入私有参数
     summarizer.model_type = "custom"
     summarizer.model = "provider-model-alias"
     summarizer.base_url = "https://gateway.example/v1"
     assert summarizer._stage_effort("auto", "detailed", "analysis") == "auto"
+
+
+@pytest.mark.asyncio
+async def test_retired_max_effort_folds_into_high_instead_of_failing() -> None:
+    """界面上已经没有「最大」这一档，但存过它的旧档案、MCP 与 Skill 仍会传 max 进来。
+    在这里报错等于让老用户一点就失败，所以折成 high 继续跑。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    summarizer.model_type = "deepseek"
+    summarizer.model = "deepseek-flash"
+    summarizer.base_url = "https://api.deepseek.com"
+    seen: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        seen.append(effort)
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    await summarizer.generate_summary(
+        "标题", [TranscriptSegment(0, 10, "一段简短转录")],
+        style="faithful", reasoning_effort="max",
+    )
+
+    assert seen and set(seen) == {"high"}
+
+
+def test_timestamp_ranges_are_normalized_to_hyphens() -> None:
+    """模型（尤其开思考那几档）爱把标题区间写成 [00:00 – 00:33]，与代码生成的目录和
+    提示词用的半角 - 不一致；同一次运行内部一致、跨次不一致，收尾统一掉。"""
+    text = (
+        "## 开场 [00:00 – 00:33]\n\n见 [01:00 — 02:00]，也见 03:00–04:00 与 a–b\n\n"
+        "## 下一节 [05:00-06:00]"
+    )
+    out = LLMSummarizer._normalize_timestamp_delimiters(text)
+    assert "[00:00-00:33]" in out and "[01:00-02:00]" in out and "03:00-04:00" in out
+    assert "[05:00-06:00]" in out
+    assert "a–b" in out, "不是「时间:时间」形状的破折号不该被动"
 
 
 def test_describe_effort_reports_effective_level() -> None:
@@ -1558,11 +1598,12 @@ def test_describe_effort_reports_effective_level() -> None:
     summarizer.model_type = "deepseek"
     summarizer.model = "deepseek-v4-flash"
     summarizer.base_url = "https://api.deepseek.com"
-    assert summarizer.describe_effort("max", "detailed") == "max"
-    assert (
-        summarizer.describe_effort("auto", "detailed")
-        == "auto（DeepSeek 通道默认关思考）"
+    assert summarizer.describe_effort("max", "detailed") == "high"
+    assert summarizer.describe_effort("auto", "detailed") == (
+        "auto（本机按 high，长视频逐段直写为 off 档）"
     )
+    # 这句以前写死"默认关思考"，默认值一改就成了假话——而它是用户在任务记录里
+    # 唯一能看到的依据，必须跟着实际档位走
 
     summarizer.model_type = "openai"
     summarizer.model = "gpt-5.6-terra"

@@ -85,13 +85,18 @@ MAX_EFFORT_BUDGET_MULTIPLIER = 5
 # DeepSeek 兼容通道不走这里，它已有 MAX_EFFORT_BUDGET_MULTIPLIER 那套膨胀机制。
 THINKING_RESERVE_TOKENS = 2_000
 _THINKING_SEEN_CHANNELS: set[tuple[str, str, str]] = set()
-# auto 档在 DeepSeek 兼容通道的默认推理档位：一律关闭思考。
-# 累计六次实测：max 思考要么吃满输出额度正文为 0（28 分钟视频思考 2.2 万字后正文 0），
-# 要么拖到十几分钟被网关掐断长流（昇腾通道 peer closed）；high 仍有万字号思考；而 off
-# 档在 8 分钟视频（95s 成稿）与 3 小时 6.2 万字真题课（8.4 分钟，90 秒块覆盖 119/120、
-# 15 道真题结论全对）上质量与 GLM agent 流程持平。要深度思考请显式选 high/max；
-# 非 DeepSeek 通道 auto 仍保持模型默认，不注入私有参数。
-STYLE_DEFAULT_EFFORT = "off"
+# auto 档在 DeepSeek 兼容通道的默认推理档位：开思考（high）。
+# 2026-10-03 同一份 25 分钟转录（13952 字 / 167 段）三档对照：off 36 秒出 30 个小节、
+# 平均每节 183 字、正文里一个时间戳都没有（带时间轴的目录，不像笔记）；high 3 分 29 秒
+# 出 11 个话题小节、平均每节 384 字、正文另带 22 个时间点，且最长一次思考 18955 字仍在
+# 额度内没被截断；max 5 分 25 秒，两个块思考吃满 16960 额度后退化成 off，成稿因此整段
+# 少了 09:29→12:04 的内容。默认从 off 换成 high 就是为了最后这两条。
+# 代价要写清：中短视频默认慢一个数量级（36s → 3.5min），想快请显式选「极速」。
+# 这条默认同样作用于"模型名里带 deepseek 的第三方免费网关"（_uses_deepseek_compatibility
+# 按名字判），那类通道有长思考流被 peer closed 掐断的旧记录——现在断流与正文为 0 都不再
+# 判死任务，但会更慢。长视频逐段直写那一档仍走 SECTION_EFFORT=off：每段只几千字，思考
+# 帮不上忙（实测 high 档每段一万多字思考只换一千字正文，28 分钟跑了 44 分钟）。
+STYLE_DEFAULT_EFFORT = "high"
 # 逐段直写（长视频）在 auto 下的档位：直接关思考。这一步是“照着几千字原文整理成稿”
 # 的局部任务，思考链帮不上忙——实测 high 档每段 1 万多字思考只换 1 千字正文，
 # 28 分钟的视频总共跑了 44 分钟；关掉后输出额度全部留给正文。
@@ -175,6 +180,12 @@ _NOTE_TIMESTAMP_RE = re.compile(
 # 所以取标题时剥掉；只认时钟样式，避免误删标题里正常的方括号内容）
 _HEADING_TIMESTAMP_RE = re.compile(
     r"\s*\[\d{1,3}:\d{2}(?::\d{2})?(?:\s*[-–—~]\s*\d{1,3}:\d{2}(?::\d{2})?)?\]$"
+)
+# 模型（尤其开思考那几档）爱把标题区间写成 [00:00 – 00:33]，而提示词与代码生成的目录用的
+# 是半角 -。同一次运行内部一致、跨次不一致，收尾统一掉；只认时间:时间两侧的空格长破折号，
+# 不动正文里正常的破折号。
+_TIMESTAMP_DASH_RE = re.compile(
+    r"(\d{1,3}:\d{2}(?::\d{2})?)\s*[–—―−]\s*(\d{1,3}:\d{2}(?::\d{2})?)"
 )
 # 模型常把公式写成 \(...\) / \[...\]，而多数 Markdown 渲染器只认 $...$ / $$...$$。
 # 成稿收尾时统一归一；代码块内是字面文本，跳过不改。
@@ -485,6 +496,10 @@ class LLMSummarizer:
             raise ValueError(f"Unsupported summary style: {style}")
         if reasoning_effort not in {"auto", "off", "high", "max"}:
             raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+        if reasoning_effort == "max":
+            # 界面上已经没有「最大」这一档（对照见 STYLE_DEFAULT_EFFORT），但存过 max 的旧档案、
+            # MCP 与 Skill 仍会把它传进来——按 high 处理。报错等于让老用户的任务直接失败。
+            reasoning_effort = "high"
         if should_abort is not None and should_abort():
             raise asyncio.CancelledError("任务已取消")
 
@@ -550,7 +565,8 @@ class LLMSummarizer:
             else:
                 self.warnings.append(f"点评与分析未生成（{reason}），笔记正文不受影响")
         await self._report_progress(progress_callback, 99, "正在保存笔记")
-        return self._normalize_math_delimiters(self._strip_code_fence(draft))
+        cleaned = self._normalize_math_delimiters(self._strip_code_fence(draft))
+        return self._normalize_timestamp_delimiters(cleaned)
 
     async def _write_condensed_notes(
         self,
@@ -971,7 +987,7 @@ class LLMSummarizer:
         lines = []
         for section, heading in zip(sections, headings):
             span = (
-                f"{format_timestamp(section[0].start)} – "
+                f"{format_timestamp(section[0].start)}-"
                 f"{format_timestamp(section[-1].end)}"
             )
             lines.append(f"- `{span}` {heading or '（该段未给出小节标题）'}")
@@ -1371,17 +1387,25 @@ class LLMSummarizer:
         return "auto"
 
     def describe_effort(self, reasoning_effort: str, style: str) -> str:
-        """返回用于任务日志的推理设置说明（auto 解析成实际档位）。"""
+        """返回用于任务日志的推理设置说明。
+
+        这里报的是**实际生效的档位**而不是用户选了什么：以前写死一句"DeepSeek 通道默认
+        关思考"，默认值一改这行日志就成了假话，而它是用户在任务记录里唯一能看到的依据。
+        """
         rejected = (
             "；该通道不支持 " + "/".join(sorted(self.rejected_params))
             if self.rejected_params
             else ""
         )
-        if reasoning_effort in {"off", "high", "max"}:
-            return f"{reasoning_effort}{rejected}"
-        if self._uses_deepseek_compatibility():
-            return f"auto（DeepSeek 通道默认关思考{rejected}）"
-        return "auto（使用模型默认）"
+        selected = "high" if reasoning_effort == "max" else reasoning_effort
+        if selected != "auto":
+            return f"{selected}{rejected}"
+        notes = self._stage_effort("auto", style, "notes")
+        if notes == "auto":
+            return "auto（使用模型默认）"
+        section = self._stage_effort("auto", style, "section")
+        resolved = notes if notes == section else f"{notes}，长视频逐段直写为 {section}"
+        return f"auto（本机按 {resolved} 档{rejected}）"
 
     def _param_cache_key(self) -> tuple[str, str, str]:
         return (
@@ -1932,6 +1956,11 @@ Markdown 脚注集中说明。不要在正文反复插入“原文如此”或�
 
 已有笔记：
 {draft}"""
+
+    @staticmethod
+    def _normalize_timestamp_delimiters(text: str) -> str:
+        """把时间区间里的长破折号统一成半角连字符。"""
+        return _TIMESTAMP_DASH_RE.sub(r"\1-\2", text)
 
     @classmethod
     def _normalize_math_delimiters(cls, text: str) -> str:

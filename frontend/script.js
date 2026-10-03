@@ -739,7 +739,12 @@ function migrateLegacyPrefs() {
     });
     next.global.include_screenshots = next.global.include_screenshots === 'true';
     next.global.use_gpu = next.global.use_gpu === 'true';
-    if (!['auto', 'off', 'high', 'max'].includes(next.global.reasoning_effort)) {
+    // 「最大」这一档已从界面上去掉（实测对笔记任务是净伤害，见后端 generate_summary 那条）；
+    // 存过它的旧偏好按「质量」处理，不要静默变成"自动"
+    if (next.global.reasoning_effort === 'max') {
+        next.global.reasoning_effort = 'high';
+    }
+    if (!['auto', 'off', 'high'].includes(next.global.reasoning_effort)) {
         next.global.reasoning_effort = 'auto';
     }
     const theme = localStorage.getItem('theme');
@@ -891,8 +896,12 @@ function applyPreferencesToForm() {
     byId('includeScreenshots').checked = prefs.global.include_screenshots === true;
     byId('useGpu').checked = prefs.global.use_gpu === true;
     byId('summaryStyle').value = prefs.global.summary_style;
-    byId('reasoningEffort').value = ['auto', 'off', 'high', 'max'].includes(prefs.global.reasoning_effort)
-        ? prefs.global.reasoning_effort : 'auto';
+    // 存过「最大」的旧偏好落到「质量」而不是被判成非法值退回 auto：
+    // 这个 select 的值就是提交给后端的 reasoning_effort，静默变 auto 会改变实际档位
+    byId('reasoningEffort').value = prefs.global.reasoning_effort === 'max'
+        ? 'high'
+        : (['auto', 'off', 'high'].includes(prefs.global.reasoning_effort)
+            ? prefs.global.reasoning_effort : 'auto');
     const processingModeInput = document.querySelector(
         `input[name="processingMode"][value="${prefs.global.processing_mode}"]`
     );

@@ -82,6 +82,18 @@ def test_completed_notice_leads_with_the_titled_file() -> None:
     assert "outputPathLabel" in body, "主行换了含义，引导语必须跟着变，否则读起来是错的"
 
 
+def test_retired_effort_option_is_mapped_not_silently_reset() -> None:
+    """下拉里去了「最大」这一档，但存过它的浏览器偏好不能静默变成"自动"。
+
+    那个 select 的值就是提交给后端的 reasoning_effort，静默改档等于替用户决定跑什么。
+    偏好迁移与读取显示两处都要映射，只写一处就会退回 auto——第一版就漏了读取那处，
+    是浏览器里点出来的。
+    """
+    assert "next.global.reasoning_effort === 'max'" in SCRIPT, "迁移路径没映射 max"
+    assert "prefs.global.reasoning_effort === 'max'" in SCRIPT, "读取显示路径没映射 max"
+    assert '<option value="max">' not in PAGE, "「最大」不该再出现在下拉里"
+
+
 def test_every_bound_element_id_exists_in_the_page() -> None:
     missing = sorted(set(BOUND_ID.findall(SCRIPT)) - set(DECLARED_ID.findall(PAGE)))
     assert not missing, f"script.js 绑定了页面里不存在的元素：{missing}"
