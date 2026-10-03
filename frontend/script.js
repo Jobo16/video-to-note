@@ -150,6 +150,7 @@ document.addEventListener('DOMContentLoaded', () => {
     safeStep(initPreferences, '读取偏好设置');
     safeStep(bindEvents, '绑定页面事件');
     safeStep(toggleSourceType, '初始化来源切换');
+    safeStep(applyServiceState, '显示本机服务地址');
     safeStep(applyMcpAccess, '初始化 MCP 接入信息');
     loadAppVersion();
     loadRecentTasks(true);
@@ -163,6 +164,15 @@ function safeStep(action, label) {
         action();
     } catch (error) {
         console.error(`[VideoToNo] ${label} 初始化失败：`, error);
+    }
+}
+
+function applyServiceState() {
+    // 地址由页面自己填：静态 HTML 里写死 localhost:8000 会在第二个实例（8001 起）上说谎，
+    // 而 location 在页面加载时就已知，不用等健康检查回来。
+    const element = byId('serviceState');
+    if (element && window.location.host) {
+        element.textContent = `本机服务 · ${window.location.host}`;
     }
 }
 
