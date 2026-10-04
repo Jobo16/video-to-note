@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
 import threading
@@ -168,3 +169,33 @@ def test_source_checkout_uses_plain_python_module(monkeypatch) -> None:
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert asr_process.child_command() == [sys.executable, "-m", "backend.asr_process"]
     assert asr_process.use_child_process() is False
+
+
+def test_worker_stdout_does_not_use_the_machine_codepage(monkeypatch) -> None:
+    """管道两端都要是 UTF-8：按 GBK 建流时，一个 GBK 装不下的字符能把工人卡死。
+
+    2026-10-04 打包版实测：转写跑完要发 `done` 时 `_emit` 抛
+    `'gbk' codec can't encode character '\\ufffd'`，异常从 `except Exception` 的补救里
+    再逃出来，noconsole 下变成 PyInstaller 的模态错误框——主程序收不到 `done`，也没有
+    超时，任务永远停在转写中。顺带这条路把中文写成了 GBK 字节，主程序按 UTF-8 解会全变问号。
+    """
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp936"))
+
+    asr_process.use_utf8_pipes()
+    asr_process._emit({"event": "done", "text": "中文转录，末尾带 \ufffd 这种字符"})
+
+    payload = json.loads(raw.getvalue().decode("utf-8"))
+    assert payload["text"] == "中文转录，末尾带 \ufffd 这种字符"
+
+
+def test_worker_builds_utf8_streams_when_stdio_is_missing(monkeypatch) -> None:
+    """打包版没有控制台时 `sys.stdout` 可能是 None，得自己按 UTF-8 建在管道句柄上。"""
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stdin", None)
+
+    asr_process.use_utf8_pipes()
+
+    assert sys.stdout.encoding.replace("-", "").lower() == "utf8"
+    assert sys.stdin.encoding.replace("-", "").lower() == "utf8"
+

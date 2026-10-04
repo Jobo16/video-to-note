@@ -221,16 +221,37 @@ def _emit(payload: dict[str, Any]) -> None:
         sys.stdout.flush()
 
 
+def use_utf8_pipes() -> None:
+    """把工人的 stdin/stdout 钉成 UTF-8——管道另一端的 `pump()` 就是按 UTF-8 解的。
+
+    打包版被重定向到管道时 `sys.stdout` 不是 `None`，Python 会按本机码页建流（本机是
+    cp936）。转写结果里只要有一个 GBK 装不下的字符（2026-10-04 实测是 U+FFFD），`_emit`
+    就抛 `UnicodeEncodeError`；它发生在 `except Exception` 的处理里，于是异常逃出
+    `child_main`，noconsole 下变成 PyInstaller 的模态错误框——工人既不回 `done` 也不退出，
+    主程序对"工人一直不回话"没有超时，任务就永远停在转写中。
+    """
+    for name, fd, mode in (("stdout", 1, "w"), ("stdin", 0, "r")):
+        stream = getattr(sys, name)
+        if stream is None:
+            setattr(
+                sys,
+                name,
+                open(fd, mode, encoding="utf-8", buffering=1 if mode == "w" else -1,
+                     closefd=False),
+            )
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def child_main() -> int:
     """读一行任务，转写完把结果发回 stdout。由 `--asr-child` 或 `-m backend.asr_process` 进入。"""
     from .main import run_transcription_local
     from .whisper_asr import TranscriptionCancelledError
 
-    # 打包版是 noconsole 应用：管道句柄是主程序给的，但 Python 不一定替我们建好流对象
-    if sys.stdout is None:
-        sys.stdout = open(1, "w", encoding="utf-8", buffering=1, closefd=False)
-    if sys.stdin is None:
-        sys.stdin = open(0, "r", encoding="utf-8", closefd=False)
+    # 打包版是 noconsole 应用：管道句柄是主程序给的，编码不能交给本机码页
+    use_utf8_pipes()
 
     job_line = sys.stdin.readline()
     if not job_line.strip():
