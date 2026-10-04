@@ -7,15 +7,19 @@ import pytest
 from backend.llm_summarizer import (
     LLM_MAX_RETRIES,
     LLM_TIMEOUT_SECONDS,
+    NOTE_BUDGET_MAX_TOKENS_MAX,
+    NOTE_BUDGET_MAX_TOKENS_MIN,
     NOTE_SECTION_CHARACTERS,
     NOTE_TAIL_CHARACTERS,
     SECTION_MAX_TOKENS_MAX,
     SECTION_MAX_TOKENS_MIN,
     SECTION_WRITE_CONCURRENCY,
+    THINKING_RESERVE_TOKENS,
     TAIL_PATCH_MAX_GAP_SECONDS,
     TAIL_PATCH_MAX_INPUT_CHARACTERS,
     LLMSummarizer,
     PROVIDER_DEFAULTS,
+    mask_proxy_target,
 )
 from backend.transcript import TranscriptSegment, segments_to_prompt
 
@@ -35,6 +39,20 @@ def _stream_response(
         )
 
     return gen()
+
+
+@pytest.fixture(autouse=True)
+def isolate_channel_caches(monkeypatch):
+    """两条模块级通道缓存按生产语义会一直存活，测试里必须各自从空集开始。
+
+    否则用例结果取决于执行顺序：前一个用例让某条配置"实测到过思考链"，后一个用例的
+    额度就凭空多出预留（``_THINKING_SEEN_CHANNELS``），或被记走一个思考参数
+    （``_REJECTED_REASONING_PARAMS``）。
+    """
+    from backend import llm_summarizer as module
+
+    monkeypatch.setattr(module, "_REJECTED_REASONING_PARAMS", {})
+    monkeypatch.setattr(module, "_THINKING_SEEN_CHANNELS", set())
 
 
 def test_note_prompt_forbids_invented_timestamps() -> None:
@@ -522,6 +540,98 @@ async def test_below_threshold_still_uses_hierarchical_reduction() -> None:
     assert progress[-1] == 99
 
 
+def test_note_budget_scales_with_material_and_keeps_thinking_room() -> None:
+    """回归（ollama gemma 用户 40 分钟视频实测）：恒定 1200 的压缩额度连思考链都装不下
+    ——一次请求思考 4505 字 / 正文 0 / finish_reason=length，整条任务死在 10%。"""
+    # 最坏情况：一个 9000 预算的块里只有约 1700 字真语音（whisper 碎段把预算吃在时间戳上）
+    assert LLMSummarizer._note_budget_max_tokens(1_700) > 1_200
+    # 大块给更多额度，不再"对大块不够、对小块过宽"
+    assert LLMSummarizer._note_budget_max_tokens(9_000) > (
+        LLMSummarizer._note_budget_max_tokens(1_700)
+    )
+    assert LLMSummarizer._note_budget_max_tokens(0) == NOTE_BUDGET_MAX_TOKENS_MIN
+    assert LLMSummarizer._note_budget_max_tokens(40_000) == NOTE_BUDGET_MAX_TOKENS_MAX
+
+
+@pytest.mark.asyncio
+async def test_chunk_compression_failure_falls_back_to_the_raw_transcript() -> None:
+    """一次分片压缩失败不该判死整条任务：该块原文直接交给成稿，内容一条不丢。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        if "这是第" in prompt and "个连续片段" in prompt:
+            if "第 1/3 个连续片段" in prompt:
+                raise RuntimeError("模型未返回正文（下发 max_tokens=1200、思考档=off）")
+            return "压缩稿"
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    result = await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert result == "# 视频笔记"
+    draft_prompt = next(prompt for prompt in prompts if "材料：" in prompt)
+    assert "第0段" in draft_prompt, "失败那一段的原文必须仍然交给成稿"
+    assert "压缩稿" in draft_prompt, "其余片段照常使用压缩结果"
+    assert any("未能整理" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_chunk_compression_cancellation_still_propagates() -> None:
+    """兜底是 ``except Exception``：用户取消（BaseException）必须原样抛出去，
+    否则会变成"取消不掉"，后台还在继续砸请求。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise asyncio.CancelledError("任务已取消")
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    with pytest.raises(asyncio.CancelledError):
+        await summarizer.generate_summary("标题", segments, style="faithful")
+
+
+@pytest.mark.asyncio
+async def test_reduce_failure_stops_at_the_current_level() -> None:
+    """归并失败就停在当前层，把未归并的片段笔记交给成稿，而不是让写了大半的任务死掉。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        if "这是第" in prompt and "个连续片段" in prompt:
+            return "片段材料" * 1_500  # 三份 6000 字，归并一定会触发
+        if "这是长视频内容的第" in prompt:
+            raise RuntimeError("模型未返回正文")
+        return "# 长视频笔记"
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index, index + 1, f"第{index}段" + "内容" * 3_500)
+        for index in range(3)
+    ]
+
+    result = await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert result == "# 长视频笔记"
+    draft_prompt = next(prompt for prompt in prompts if "材料：" in prompt)
+    assert "片段材料" in draft_prompt
+    assert any("已停止归并" in warning for warning in summarizer.warnings)
+
+
 _SECTION_RANGE_RE = re.compile(r"覆盖时间轴 (\S+?) – (\S+?)。")
 _SECTION_COVERS_RE = re.compile(r"（覆盖到 (\S+?)）")
 
@@ -569,7 +679,8 @@ def test_section_stage_effort_disables_thinking_in_auto_mode() -> None:
 
     # 逐段直写是局部任务：实测 high 档每段 1 万多字思考只换 1 千字正文，auto 下直接关思考
     assert summarizer._stage_effort("auto", "faithful", "section") == "off"
-    assert summarizer._stage_effort("auto", "faithful", "notes") == "off"
+    # 而中短路径的压缩与成稿走 STYLE_DEFAULT_EFFORT（2026-10-03 三档对照后从 off 换成 high）
+    assert summarizer._stage_effort("auto", "faithful", "notes") == "high"
     # 用户显式选择仍然优先
     assert summarizer._stage_effort("max", "faithful", "section") == "max"
     assert summarizer._stage_effort("off", "faithful", "section") == "off"
@@ -600,7 +711,7 @@ async def test_long_transcript_writes_sections_without_merging() -> None:
     assert "这份笔记覆盖四段内容。" in result
     # 目录由代码生成：区间端点必须落在整片时间轴上
     toc = result.split("## 本片目录")[1].split("## 小节")[0]
-    assert "`00:00 –" in toc and "写到结尾" in result.split("## 小节4")[1]
+    assert "`00:00-" in toc and "写到结尾" in result.split("## 小节4")[1]
     assert progress == sorted(progress)
     assert progress[-1] == 99
 
@@ -959,8 +1070,9 @@ async def test_explicit_effort_is_respected_by_mechanical_stages() -> None:
     ]
     # 4 次段内续写 + 1 次概览
     assert len(mechanical) == 5
-    # 用户显式选了档位，机械阶段也照它的选择下发
-    assert set(mechanical) == {"max"}
+    # 用户显式选了档位，机械阶段也照它的选择下发；而「最大」在入口就被折成「高」
+    # （界面上已去掉这一档，实测它对笔记是净伤害），所以这里收到的是 high 不是 max
+    assert set(mechanical) == {"high"}
 
 
 @pytest.mark.asyncio
@@ -1421,24 +1533,62 @@ def test_auto_resolves_style_default_only_on_deepseek_compatible_channels() -> N
     summarizer.model_type = "deepseek"
     summarizer.model = "deepseek-v4-flash"
     summarizer.base_url = "https://api.deepseek.com"
-    assert summarizer._stage_effort("auto", "detailed", "notes") == "off"
-    assert summarizer._stage_effort("auto", "faithful", "notes") == "off"
-    assert summarizer._stage_effort("auto", "concise", "notes") == "off"
+    assert summarizer._stage_effort("auto", "detailed", "notes") == "high"
+    assert summarizer._stage_effort("auto", "faithful", "notes") == "high"
+    assert summarizer._stage_effort("auto", "concise", "notes") == "high"
     # 用户显式选择永远优先
     assert summarizer._stage_effort("off", "detailed", "notes") == "off"
     assert summarizer._stage_effort("high", "detailed", "analysis") == "high"
 
-    # custom 通道识别出 DeepSeek 模型时同样吃到风格默认
+    # custom 通道识别出 DeepSeek 模型时同样吃到风格默认（所以默认换成 high 也覆盖到
+    # ModelScope 这类免费代理——那条通道有长思考流被掐断的旧记录，是这次改动的已知风险）
     summarizer.model_type = "custom"
     summarizer.model = "deepseek-ai/DeepSeek-V4-Flash-0731"
     summarizer.base_url = "https://api-inference.modelscope.cn/v1/"
-    assert summarizer._stage_effort("auto", "detailed", "notes") == "off"
+    assert summarizer._stage_effort("auto", "detailed", "notes") == "high"
 
     # 非 DeepSeek 通道保持模型默认，不注入私有参数
     summarizer.model_type = "custom"
     summarizer.model = "provider-model-alias"
     summarizer.base_url = "https://gateway.example/v1"
     assert summarizer._stage_effort("auto", "detailed", "analysis") == "auto"
+
+
+@pytest.mark.asyncio
+async def test_retired_max_effort_folds_into_high_instead_of_failing() -> None:
+    """界面上已经没有「最大」这一档，但存过它的旧档案、MCP 与 Skill 仍会传 max 进来。
+    在这里报错等于让老用户一点就失败，所以折成 high 继续跑。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    summarizer.model_type = "deepseek"
+    summarizer.model = "deepseek-flash"
+    summarizer.base_url = "https://api.deepseek.com"
+    seen: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        seen.append(effort)
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    await summarizer.generate_summary(
+        "标题", [TranscriptSegment(0, 10, "一段简短转录")],
+        style="faithful", reasoning_effort="max",
+    )
+
+    assert seen and set(seen) == {"high"}
+
+
+def test_timestamp_ranges_are_normalized_to_hyphens() -> None:
+    """模型（尤其开思考那几档）爱把标题区间写成 [00:00 – 00:33]，与代码生成的目录和
+    提示词用的半角 - 不一致；同一次运行内部一致、跨次不一致，收尾统一掉。"""
+    text = (
+        "## 开场 [00:00 – 00:33]\n\n见 [01:00 — 02:00]，也见 03:00–04:00 与 a–b\n\n"
+        "## 下一节 [05:00-06:00]"
+    )
+    out = LLMSummarizer._normalize_timestamp_delimiters(text)
+    assert "[00:00-00:33]" in out and "[01:00-02:00]" in out and "03:00-04:00" in out
+    assert "[05:00-06:00]" in out
+    assert "a–b" in out, "不是「时间:时间」形状的破折号不该被动"
 
 
 def test_describe_effort_reports_effective_level() -> None:
@@ -1448,11 +1598,12 @@ def test_describe_effort_reports_effective_level() -> None:
     summarizer.model_type = "deepseek"
     summarizer.model = "deepseek-v4-flash"
     summarizer.base_url = "https://api.deepseek.com"
-    assert summarizer.describe_effort("max", "detailed") == "max"
-    assert (
-        summarizer.describe_effort("auto", "detailed")
-        == "auto（DeepSeek 通道默认关思考）"
+    assert summarizer.describe_effort("max", "detailed") == "high"
+    assert summarizer.describe_effort("auto", "detailed") == (
+        "auto（本机按 high，长视频逐段直写为 off 档）"
     )
+    # 这句以前写死"默认关思考"，默认值一改就成了假话——而它是用户在任务记录里
+    # 唯一能看到的依据，必须跟着实际档位走
 
     summarizer.model_type = "openai"
     summarizer.model = "gpt-5.6-terra"
@@ -1718,3 +1869,299 @@ async def test_dropped_stream_with_partial_content_is_not_retried() -> None:
     with pytest.raises(RuntimeError, match="peer closed"):
         await summarizer._complete("测试", 800, "high")
     assert summarizer.warnings == []
+
+
+# ------------------------------------------------- 测试连接的绕代理重试（1.4.2「重启电脑才行」悬案的对症路）
+
+
+def test_mask_proxy_target_hides_userinfo() -> None:
+    """诊断信息允许出现"代理指向哪"，绝不允许带出代理的账号段。"""
+    assert mask_proxy_target("http://user:supersecret@127.0.0.1:7890") == "http://***@127.0.0.1:7890"
+    assert mask_proxy_target("socks5://127.0.0.1:7891") == "socks5://127.0.0.1:7891"
+    assert mask_proxy_target("") == ""
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _connection_error():
+    import httpx
+    import openai
+
+    return openai.APIConnectionError(request=httpx.Request("POST", "https://api.example.test/v1"))
+
+
+@pytest.mark.asyncio
+async def test_test_connection_retries_direct_when_env_proxy_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """走环境代理连不上时自动直连重试；两条路都要在消息里说清。"""
+    attempts: list[str] = []
+    created: list[str] = []
+
+    class FakeCompletions:
+        def __init__(self, tag: str) -> None:
+            self._tag = tag
+
+        async def create(self, **kwargs):
+            attempts.append(self._tag)
+            if self._tag == "proxied":
+                raise _connection_error()
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))]
+            )
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            tag = "direct" if created else "proxied"
+            created.append(tag)
+            self.chat = SimpleNamespace(completions=FakeCompletions(tag))
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, message, _latency = await summarizer.test_connection()
+
+    assert ok is True
+    assert attempts == ["proxied", "direct"]
+    assert "直连成功" in message
+    assert "HTTPS_PROXY=" in message
+
+
+@pytest.mark.asyncio
+async def test_test_connection_direct_retry_also_failing_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """绕开代理也连不上时，把"整条网络都不通"说出口，别只报代理。"""
+    attempts: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            attempts.append(1)
+            raise _connection_error()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(attempts) == 2
+    assert "绕开代理直连也一样失败" in message
+
+
+@pytest.mark.asyncio
+async def test_test_connection_skips_retry_without_env_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有环境代理就没有"换条路"可言：失败直接返回，不建第二个客户端。"""
+    created: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            raise _connection_error()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            created.append(1)
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, _message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_test_connection_does_not_retry_on_auth_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """401 这类与代理无关的失败不再重试，免得把"Key 不对"搅成网络问题。"""
+    attempts: list[int] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            attempts.append(1)
+            raise RuntimeError("HTTP 401")
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        async def close(self) -> None:
+            pass
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+
+    summarizer = LLMSummarizer(model_type="deepseek", api_key="sk-test")
+    ok, _message, _latency = await summarizer.test_connection()
+
+    assert ok is False
+    assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# 思考链吃满输出额度（本地 ollama 用户 2026-10-03 的实测日志：一次压缩请求
+# 思考 4505 字 / 正文 0 / finish_reason=length，整条任务死在 10%）
+# ---------------------------------------------------------------------------
+
+
+def _ollama_like(model: str = "gemma4:e4b") -> LLMSummarizer:
+    """一条"本程序没有思考开关"的通道：custom + 非 DeepSeek 模型名 + 本机地址。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.model_type = "custom"
+    summarizer.model = model
+    summarizer.base_url = "http://127.0.0.1:11434/v1"
+    summarizer.warnings = []
+    return summarizer
+
+
+def _fake_client(summarizer: LLMSummarizer, create) -> None:
+    summarizer.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+
+def test_reserve_waits_for_evidence_and_never_overrides_degradation() -> None:
+    from backend import llm_summarizer as module
+
+    summarizer = _ollama_like()
+    assert not summarizer._controls_thinking()
+    assert summarizer._build_request("p", 1_600, "auto")["max_tokens"] == 1_600
+    # 换档对这条通道既不下发思考参数也不改变额度——所以失败文案不该劝人换档
+    assert summarizer._build_request("p", 1_600, "high")["max_tokens"] == 1_600
+
+    module._THINKING_SEEN_CHANNELS.add(summarizer._param_cache_key())
+    assert summarizer._build_request("p", 1_600, "auto")["max_tokens"] == (
+        1_600 + THINKING_RESERVE_TOKENS
+    )
+    # 降级到 requested 时不叠加预留：那条路正是网关嫌额度太大才退回来的
+    assert summarizer._build_request("p", 1_600, "auto", budget="requested")["max_tokens"] == 1_600
+
+
+@pytest.mark.asyncio
+async def test_stream_records_that_the_channel_actually_thinks() -> None:
+    async def create(**kwargs):
+        return _stream_response("正文", reasoning="思考" * 100)
+
+    summarizer = _ollama_like()
+    _fake_client(summarizer, create)
+
+    assert not summarizer.thinking_seen
+    assert await summarizer._complete("测试", 1_600, "off") == "正文"
+    assert summarizer.thinking_seen
+    assert any("改档位也不会变" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_empty_content_advice_stops_offering_a_no_op_knob() -> None:
+    """回归：1.4.2 那句"请改用「高」或「最大」档"是给 DeepSeek 兼容通道写的，
+    在 ollama 上换档既不下发思考参数也不抬高额度，照做只会原地重投。"""
+
+    async def create(**kwargs):
+        return _stream_response(None, "length", reasoning="思考" * 2_000)
+
+    summarizer = _ollama_like()
+    _fake_client(summarizer, create)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await summarizer._complete("测试", 1_200, "off")
+
+    assert "没有这条通道的思考开关" in str(excinfo.value)
+    assert "请改用「高」" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tail_patch_failure_keeps_the_finished_draft() -> None:
+    """补写只是可选增强：只 catch TimeoutError 时，一次「模型未返回正文」会把已经
+    写完整的笔记一起判死。用户实测同一 18 分钟视频「详细复原」失败、「精简摘要」通过，
+    差别正是 concise 在函数开头就跳过了补写。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise RuntimeError("模型未返回正文（下发 max_tokens=1600、思考档=off）")
+
+    summarizer._complete = complete
+    # 缺口 299 秒：在 TAIL_PATCH_MAX_GAP_SECONDS 之内，确实会发出补写请求
+    segments = [
+        TranscriptSegment(index * 60.0, index * 60.0 + 59.0, f"第{index}段内容")
+        for index in range(8)
+    ]
+    draft = "## 小节 [00:00-02:00]\n\n已经写好的正文"
+
+    result = await summarizer._ensure_tail_coverage(
+        "标题", draft, segments, "faithful", "off", None, None
+    )
+
+    assert result == draft
+    assert any("补写结尾失败" in warning for warning in summarizer.warnings)
+
+
+@pytest.mark.asyncio
+async def test_tail_patch_cancellation_still_propagates() -> None:
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        raise asyncio.CancelledError("任务已取消")
+
+    summarizer._complete = complete
+    segments = [
+        TranscriptSegment(index * 60.0, index * 60.0 + 59.0, f"第{index}段内容")
+        for index in range(8)
+    ]
+
+    with pytest.raises(asyncio.CancelledError):
+        await summarizer._ensure_tail_coverage(
+            "标题", "## 小节 [00:00-02:00]\n\n正文", segments, "faithful", "off", None, None
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_transcript_is_not_split_by_timestamp_overhead() -> None:
+    """碎 ASR 行的时间戳开销曾把 7 分钟的视频切成多块，每块都要押一次有损压缩调用。
+    先合并成 ~48 字长行再切，这个规模就该是一次成稿、零压缩调用。"""
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", retry_empty=True, **kwargs):
+        prompts.append(prompt)
+        return "# 视频笔记"
+
+    summarizer._complete = complete
+    # 300 段 × 8 字：净字数只有 2400，但逐行摊上 32 字开销就是 12000，超过 9000 预算
+    segments = [
+        TranscriptSegment(index * 1.5, index * 1.5 + 1.4, "字" * 8) for index in range(300)
+    ]
+
+    await summarizer.generate_summary("标题", segments, style="faithful")
+
+    assert not any("个连续片段" in prompt for prompt in prompts), "不该再发分片压缩请求"
+    assert len(prompts) == 1

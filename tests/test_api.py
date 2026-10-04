@@ -2,15 +2,17 @@ import asyncio
 import io
 import json
 import time
+import urllib.request
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
 
 import launcher
-from backend import main
+from backend import bili_login, douyin_login, main
 from backend.config_store import BILI_CREDENTIALS_FILE, ConfigStore
 from backend.llm_summarizer import LLMSummarizer, utf8_safe
 from backend.transcript import TranscriptSegment
@@ -124,7 +126,7 @@ def test_health_and_frontend_are_served() -> None:
     client = TestClient(main.app)
     health = client.get("/api/health")
     assert health.status_code == 200
-    assert health.json()["version"] == "1.4.2"
+    assert health.json()["version"] == "1.4.5"
     assert health.json()["version"] == launcher.VERSION
     assert health.json()["service"] == "VideoToNo"
     assert health.json()["mode"] == "dev"  # 测试进程非打包；打包版应报 portable
@@ -405,6 +407,42 @@ def test_platform_403_maps_to_the_platform_of_the_task() -> None:
     )
 
 
+def test_context_limit_error_says_which_window_to_widen() -> None:
+    """回归：本地小模型（ollama 默认 num_ctx 只有 2048）跑长一点的视频时整条请求被通道拒掉，
+    原样透传的英文报错让用户以为「程序里有个 token 限制可以去调」。"""
+    for raw in (
+        # ollama：下发的输出额度超过模型窗口
+        "Error code: 400 - {'error': {'message': 'maximum context length is 2048 tokens, "
+        "however you requested 4600 tokens', 'type': 'invalid_request_error'}}",
+        # ollama / vLLM：提示词本身超窗，且带 OpenAI 系的错误码
+        "Error code: 400 - {'error': {'message': 'prompt has 5234 tokens which exceeds the "
+        "maximum context length (2048 tokens)', 'code': 'context_length_exceeded'}}",
+        # Anthropic 系说法
+        "Error code: 400 - {'error': {'message': 'prompt is too long: 200000 tokens > "
+        "100000 maximum'}}",
+        # 排序陷阱：这条含裸子串 "403"，若让权限分支先命中就成了「Key 没有该模型的权限」
+        "Error code: 400 - {'error': {'message': \"This model's maximum context length is "
+        '8192 tokens. However, you requested 9403 tokens\'}}',
+    ):
+        message = main.friendly_task_error(
+            raw, source=main.VideoSource.LOCAL, step_name=main.NOTE_STEP_NAME
+        )
+        assert "上下文窗口" in message and "num_ctx" in message, raw
+
+
+def test_rate_limit_is_not_reported_as_a_context_limit() -> None:
+    """OpenAI 限流的原文就是 `Too many tokens per minute`，按 token 字样判会把限流说成
+    窗口不够——照着提示去调 num_ctx 不会有任何改变（正是 1.4.0 修掉的那类张冠李戴）。"""
+    raw = (
+        "Error code: 429 - {'error': {'message': 'Too many tokens per minute, "
+        "please wait 10 seconds before trying again', 'type': 'rate_limit_exceeded'}}"
+    )
+    message = main.friendly_task_error(
+        raw, source=main.VideoSource.DOUYIN, step_name=main.NOTE_STEP_NAME
+    )
+    assert "限流" in message and "上下文" not in message
+
+
 def test_scrubbed_error_hides_keys_but_keeps_the_status() -> None:
     assert (
         main.scrub_technical_error("Error code: 403 with key sk-abcdef12345\n second line")
@@ -552,8 +590,13 @@ def test_archive_note_deduplicates_names(monkeypatch, tmp_path) -> None:
 def test_archive_note_ignored_by_task_discovery(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
     main.archive_note("某个视频", "# 笔记")
+    main.archive_note("某个视频【转录】", "# 转录", folder=main.TRANSCRIPTS_DIR_NAME)
 
     assert main.find_reusable_task("https://www.bilibili.com/video/BV1xx") is None
+    # 两个归档目录都不带 task.json，重启恢复时不能被当成任务
+    main.restore_tasks_from_workspace()
+    assert main.NOTES_DIR_NAME not in main.tasks
+    assert main.TRANSCRIPTS_DIR_NAME not in main.tasks
 
 
 def test_download_returns_markdown_file(
@@ -575,6 +618,73 @@ def test_download_returns_markdown_file(
     assert response.content.decode("utf-8") == "# 下载测试"
     assert ".md" in response.headers["content-disposition"]
     assert not (task_dir / "video-notes.zip").exists()
+    main.tasks.pop(task_id, None)
+
+
+def test_download_stem_marks_parts_and_transcripts() -> None:
+    """同一视频逐 P 跑、或先转写后笔记，产物不能全叫一个名字。"""
+    one_of_three = {
+        "bili_pages": [{"page": 2, "part": "第二章 梯度"}],
+        "bili_total_pages": 3,
+    }
+    assert main.download_stem("深度学习课", one_of_three) == "深度学习课【P2 第二章 梯度】"
+    assert (
+        main.download_stem("深度学习课", one_of_three, "transcript")
+        == "深度学习课【P2 第二章 梯度】【转录】"
+    )
+    # 单 P 视频、以及一次跑完的分 P 视频：没有歧义，不加噪声
+    assert main.download_stem("深度学习课", {"bili_total_pages": 1}) == "深度学习课"
+    assert main.download_stem(
+        "深度学习课",
+        {
+            "bili_pages": [{"page": 1, "part": "第一章"}, {"page": 2, "part": "第二章"}],
+            "bili_total_pages": 2,
+        },
+    ) == "深度学习课"
+    # 多个分 P 的子集只报页码：分 P 名逐个拼进文件名会长到没法看
+    assert main.download_stem(
+        "深度学习课",
+        {
+            "bili_pages": [{"page": 1, "part": "甲"}, {"page": 3, "part": "丙"}],
+            "bili_total_pages": 5,
+        },
+    ) == "深度学习课【P1、3】"
+    # 80 字预算里被保住的是后缀，不是标题尾部
+    long_name = main.download_stem("长" * 90, one_of_three)
+    assert len(long_name) == 80 and long_name.endswith("【P2 第二章 梯度】")
+
+
+def test_download_names_files_after_the_part_and_status_shows_the_same_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """网页端拼 txt/html/png 用的名字必须来自后端，和 .md 下载同一个来源。"""
+    task_id = "part-naming"
+    task_dir = tmp_path / task_id
+    task_dir.mkdir()
+    (task_dir / "notes.md").write_text("# 分P笔记", encoding="utf-8")
+    (task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "title": "深度学习课",
+                "bili_pages": [{"page": 2, "part": "第二章 梯度"}],
+                "bili_total_pages": 3,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    main.tasks[task_id] = main.new_task()
+    main.tasks[task_id].update(status="completed", result={"title": "深度学习课"})
+
+    status = TestClient(main.app).get(f"/api/task/{task_id}").json()
+    response = TestClient(main.app).get(f"/api/download/{task_id}")
+
+    assert status["download_name"] == "深度学习课【P2 第二章 梯度】"
+    assert "深度学习课【P2 第二章 梯度】.md" in unquote(
+        response.headers["content-disposition"]
+    )
     main.tasks.pop(task_id, None)
 
 
@@ -1226,6 +1336,76 @@ async def test_local_task_title_uses_uploaded_filename(
 
 
 @pytest.mark.asyncio
+async def test_transcript_only_task_archives_a_titled_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归（群测原话"现在都叫 transcript.md"）：纯转录只在 `workspace/<UUID>/` 里留一个
+    固定名文件，而那个 UUID 目录是工作目录（音频与 task.json 都在里面），不该是用户
+    要拿的产物。产物落到 `workspace/transcripts/`，名字与下载名同一个来源。"""
+    task_id = "transcript-archive"
+    media = tmp_path / task_id / "input.mp4"
+    media.parent.mkdir()
+    media.write_bytes(b"bits")
+
+    class FakeProcessor:
+        @staticmethod
+        def detect_source(*args, **kwargs):
+            return main.VideoSource.LOCAL
+
+        @staticmethod
+        async def get_video_info(url_or_path, cookie=None, allow_local=False, notes=None):
+            return {"title": Path(url_or_path).stem, "source": "local", "duration": 12}
+
+        @staticmethod
+        async def cleanup(value):
+            return None
+
+    class FakeTranscriber:
+        @staticmethod
+        async def transcribe(
+            media_path,
+            model,
+            use_gpu,
+            initial_prompt=None,
+            cancel_event=None,
+            progress_callback=None,
+        ):
+            return {
+                "segments": [
+                    TranscriptSegment(0, 12, "这是一段用来通过文字质量检查的本地视频口播内容")
+                ],
+                "language": "zh",
+                "model": model,
+                "requested_model": model,
+                "device": "cpu",
+                "duration": 12,
+            }
+
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "video_processor", FakeProcessor())
+    monkeypatch.setattr(main, "transcriber", FakeTranscriber())
+    task = main.new_task(status="uploaded", task_id=task_id)
+    task.update(uploaded_file_path=str(media), uploaded_filename="课程 第一讲.mp4")
+    main.tasks[task_id] = task
+
+    await main.process_video_task(
+        task_id,
+        main.SummarizeRequest(
+            video_url=str(media), output="transcript", llm_config=main.LLMConfig()
+        ),
+    )
+
+    finished = main.tasks[task_id]
+    assert finished["status"] == "completed"
+    archived = Path(finished["result"]["archived_path"])
+    assert archived.parent == tmp_path / main.TRANSCRIPTS_DIR_NAME
+    assert archived.name == "课程 第一讲【转录】.md"
+    assert "口播内容" in archived.read_text(encoding="utf-8")
+    # 工作目录里那份照旧留着：音频、transcript.json 与它都在，排查时还要用
+    assert (tmp_path / task_id / "transcript.md").is_file()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_merges_all_bilibili_pages_from_ai_subtitles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1459,6 +1639,77 @@ async def test_pipeline_passes_bilibili_pages_to_subtitle_fetch(
     await main.process_video_task(task_id, request)
 
     assert captured["only_pages"] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_single_part_task_archives_under_the_part_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只跑一个分 P 的任务，归档与状态里的名字要带上 P 号和分 P 名。
+
+    这条钉的是整条链：view 接口给的分 P 清单 → task.json → 文件名。缺任一环，
+    用户从下载目录拿到的就是几个同名的 `深度学习课.md`。
+    """
+    processor = VideoProcessor(tmp_path)
+
+    async def fake_info(*args, **kwargs):
+        return {"title": "深度学习课", "source": "bilibili", "duration": 0, "owner": "作者"}
+
+    async def fake_subtitles(*args, **kwargs):
+        return None
+
+    async def fake_bili_subtitles(url, cookie=None, only_pages=None):
+        page = BiliPage(page=2, part="第二章 梯度", cid=102, duration=90)
+        sub = SubtitleResult(
+            [TranscriptSegment(0, 5, "P2字幕")], "zh-CN", "bilibili_ai_subtitle"
+        )
+        return BiliSubtitleOutcome(
+            sub,
+            "ok",
+            title="深度学习课",
+            total_pages=3,
+            pages=(page,),
+            subtitle_by_page=((2, sub),),
+        )
+
+    class FakeSummarizer:
+        def __init__(self, **kwargs):
+            pass
+        def describe_effort(self, reasoning_effort: str, style: str) -> str:
+            return reasoning_effort
+
+        async def generate_summary(self, *args, **kwargs):
+            return "# 测试笔记"
+
+    monkeypatch.setattr(processor, "get_video_info", fake_info)
+    monkeypatch.setattr(processor, "fetch_subtitles", fake_subtitles)
+    monkeypatch.setattr(processor, "fetch_bilibili_subtitles", fake_bili_subtitles)
+    monkeypatch.setattr(main, "video_processor", processor)
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "LLMSummarizer", FakeSummarizer)
+
+    task_id = "single-part-name"
+    (tmp_path / task_id).mkdir()
+    main.tasks[task_id] = main.new_task()
+    request = main.SummarizeRequest(
+        video_url="https://www.bilibili.com/video/BV1xx?p=2",
+        bilibili_pages=[2],
+        llm_config=main.LLMConfig(model_type="deepseek", api_key="test-key"),
+    )
+
+    await main.process_video_task(task_id, request)
+
+    expected = "深度学习课【P2 第二章 梯度】"
+    assert main.tasks[task_id]["status"] == "completed"
+    assert json.loads((tmp_path / task_id / "task.json").read_text("utf-8"))[
+        "bili_pages"
+    ] == [{"page": 2, "part": "第二章 梯度"}]
+    assert (tmp_path / "notes" / f"{expected}.md").is_file()
+
+    client = TestClient(main.app)
+    assert client.get(f"/api/task/{task_id}").json()["download_name"] == expected
+    assert expected in unquote(client.get(f"/api/download/{task_id}").headers["content-disposition"])
+    main.tasks.pop(task_id, None)
 
 
 def test_bili_pages_endpoint_returns_page_list(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2021,6 +2272,157 @@ def test_llm_test_survives_lone_surrogate_in_model_reply(
     assert LONE_SURROGATE not in body["message"]
 
 
+def test_llm_test_reports_unreadable_key_store_without_http_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """密钥档案读不了（磁盘被拖垮 / DPAPI 失灵 / 文件损坏）要回可读错误，不能裸 500。
+
+    1.4.2 悬案里前端只剩「（HTTP 500）」，就是这类异常从 except RuntimeError 的
+    缝隙漏出去的结果。
+    """
+
+    def boom(*args, **kwargs):
+        raise OSError("模拟磁盘被拖垮")
+
+    monkeypatch.setattr(main, "resolve_llm_credentials", boom)
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/llm-test", json={"model_type": "deepseek"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "读取本机保存的 Key 失败" in body["error"]
+    assert "OSError" in body["error"]
+
+
+# --------------------------------------------------------------------------- 本机自检（1.4.2 悬案的取证出口）
+
+
+def test_diagnostics_reports_probe_results_without_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/api/diagnostics 的探测全部可注入；报告里永远没有密钥与代理账号段。"""
+
+    def fake_probe(url: str, timeout: float = 4.0, *, use_proxy: bool) -> dict:
+        if "127.0.0.1" in url:
+            return {"ok": True, "status": 200, "body": json.dumps({"service": "VideoToNo"})}
+        return {"ok": True, "status": 200, "body": ""}
+
+    monkeypatch.setattr(main, "_http_probe", fake_probe)
+    monkeypatch.setattr(main, "_resolve_host", lambda host: {"ok": True, "addresses": ["203.0.113.7"]})
+    monkeypatch.setattr(main, "_wininet_proxy_snapshot", lambda: {"available": False})
+    monkeypatch.setattr(main, "_count_free_cdp_ports", lambda start=9333, count=20: 20)
+    monkeypatch.setattr(main, "config_store", ConfigStore(tmp_path))
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:supersecret@127.0.0.1:7890")
+
+    response = TestClient(main.app).get("/api/diagnostics")
+
+    assert response.status_code == 200
+    body = response.json()
+    checks = body["checks"]
+    assert body["ok"] is True
+    assert checks["loopback_http"]["is_ours"] is True
+    assert checks["service"]["version"] == main.app.version
+    assert checks["cdp_ports_free"] == 20
+    assert checks["dns"]["api.deepseek.com"]["ok"] is True
+    assert checks["outbound"]["direct"]["ok"] is True
+    assert "***@127.0.0.1:7890" in checks["system_proxy"]["env"]
+    assert "supersecret" not in response.text
+    assert body["hints"]
+
+
+def test_unhandled_error_handler_survives_redaction_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """兜底处理器里的脱敏再炸，也要回得出 JSON——兜错误的地方不能自己再崩。"""
+
+    class Boom:
+        def keys_are_corrupt(self):
+            raise RuntimeError("boom")
+
+    def exploding_redact(text):
+        raise RuntimeError("脱敏炸了")
+
+    monkeypatch.setattr(main, "redact_secrets", exploding_redact)
+    monkeypatch.setattr(main, "config_store", Boom())
+    response = TestClient(main.app, raise_server_exceptions=False).get("/api/llm-keys")
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert "后端内部错误" in response.json()["detail"]
+
+
+def test_free_cdp_port_survives_winsock_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Winsock 被系统级问题拖垮时返回"没有可用端口"，而不是把裸 OSError 漏成 500。"""
+
+    def boom(*args, **kwargs):
+        raise OSError("Winsock 不可用")
+
+    for module in (bili_login, douyin_login):
+        monkeypatch.setattr(module.socket, "socket", boom)
+        assert module.free_cdp_port() is None
+
+
+def test_cdp_openers_bypass_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """urllib 在 Windows 会读注册表系统代理；CDP 的 opener 必须显式不挂任何代理。
+
+    空 ProxyHandler 不贡献任何方法，不会留在 handlers 里——所以这里把
+    getproxies 投毒后重新构建一次：默认 opener 会把毒代理吃进去，显式空代理的
+    构建方式则无论 handlers 里有没有 ProxyHandler，代理表都是空的。
+    """
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://127.0.0.1:9"})
+    for module in (bili_login, douyin_login):
+        opener = module._no_proxy_opener()
+        proxy_handlers = [
+            handler
+            for handler in opener.handlers
+            if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        assert all(handler.proxies == {} for handler in proxy_handlers)
+
+
+def test_update_check_endpoint_reports_newer_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    """启动自检的更新端点：新版本在场时给全 tag/地址/节选，交前端弹窗。"""
+    monkeypatch.setattr(
+        main.update_check,
+        "fetch_latest_release",
+        lambda current, timeout=5.0: {
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/example/release",
+            "update_available": True,
+            "notes": "修复若干",
+        },
+    )
+    response = TestClient(main.app).get("/api/update/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["update_available"] is True
+    assert body["latest_version"] == "v9.9.9"
+    assert body["current_version"] == main.app.version
+    assert body["release_url"] == "https://github.com/example/release"
+    assert body["notes"] == "修复若干"
+
+
+def test_update_check_endpoint_survives_github_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitHub 连不上时回 200 + ok=False，前端静默，不当成错误打扰用户。"""
+
+    def boom(current, timeout=5.0):
+        raise OSError("网络不通")
+
+    monkeypatch.setattr(main.update_check, "fetch_latest_release", boom)
+    response = TestClient(main.app).get("/api/update/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert "OSError" in body["error"]
+
+
 def test_unhandled_backend_error_comes_back_as_json(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2205,6 +2607,7 @@ def test_download_falls_back_to_transcript_without_notes(tmp_path, monkeypatch) 
 
     assert response.status_code == 200
     assert "字幕稿正文" in response.text
+    assert "字幕稿【转录】.md" in unquote(response.headers["content-disposition"])
     main.tasks.pop(task_id, None)
 
 

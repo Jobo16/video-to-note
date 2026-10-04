@@ -125,6 +125,8 @@ let maxUploadBytes = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024;
 let maxUploadLabel = `${DEFAULT_MAX_UPLOAD_MB / 1024} GB`;
 let currentMarkdown = '';
 let currentHtml = '';
+// 后端下发的下载名（含视频标题与 B 站分 P 名），空串时回退成时间戳名
+let currentDownloadName = '';
 let pollTimer = null;
 let pollErrorCount = 0;
 let isSubmitting = false;
@@ -148,9 +150,12 @@ document.addEventListener('DOMContentLoaded', () => {
     safeStep(initPreferences, '读取偏好设置');
     safeStep(bindEvents, '绑定页面事件');
     safeStep(toggleSourceType, '初始化来源切换');
+    safeStep(applyServiceState, '显示本机服务地址');
     safeStep(applyMcpAccess, '初始化 MCP 接入信息');
     loadAppVersion();
     loadRecentTasks(true);
+    // 启动自检更新：晚几秒再发，别跟首屏请求抢路；失败静默，托盘里有手动入口
+    window.setTimeout(runStartupUpdateCheck, 2500);
     window.__videoToNoReady = true;
 });
 
@@ -159,6 +164,15 @@ function safeStep(action, label) {
         action();
     } catch (error) {
         console.error(`[VideoToNo] ${label} 初始化失败：`, error);
+    }
+}
+
+function applyServiceState() {
+    // 地址由页面自己填：静态 HTML 里写死 localhost:8000 会在第二个实例（8001 起）上说谎，
+    // 而 location 在页面加载时就已知，不用等健康检查回来。
+    const element = byId('serviceState');
+    if (element && window.location.host) {
+        element.textContent = `本机服务 · ${window.location.host}`;
     }
 }
 
@@ -284,6 +298,10 @@ function bindEvents() {
     bindListener('renameProfileBtn', 'click', handleProfileRenameClick);
     bindListener('llmModel', 'change', handleModelChange);
     bindListener('llmTestBtn', 'click', testLlmConnection);
+    bindListener('diagBtn', 'click', runDiagnostics);
+    bindListener('updateAcceptBtn', 'click', acceptUpdateOffer);
+    bindListener('updateIgnoreBtn', 'click', ignoreUpdateOffer);
+    bindListener('updateCancelBtn', 'click', dismissUpdateOffer);
     bindListener('saveKeyBtn', 'click', saveApiKey);
     bindListener('clearKeyBtn', 'click', clearSavedKey);
     bindListener('customProfileAddBtn', 'click', addCustomProfile);
@@ -526,7 +544,7 @@ async function openRecentTask(taskId) {
         if (Array.isArray(task.logs)) updateLogs(task.logs);
 
         if (task.status === 'completed') {
-            await completeTask(task.result, task.elapsed_seconds);
+            await completeTask(task.result, task.elapsed_seconds, task.download_name);
         } else if (['queued', 'processing', 'cancelling'].includes(task.status)) {
             setTaskActive(true);
             startElapsedTimer(task.elapsed_seconds);
@@ -597,7 +615,8 @@ function defaultPrefs() {
             processing_mode: 'restart',
             output_mode: 'note'
         },
-        ui: { theme: 'system', mcp_hint_seen: false }
+        ui: { theme: 'system', mcp_hint_seen: false },
+        update: { ignored_version: '' }
     };
 }
 
@@ -720,7 +739,12 @@ function migrateLegacyPrefs() {
     });
     next.global.include_screenshots = next.global.include_screenshots === 'true';
     next.global.use_gpu = next.global.use_gpu === 'true';
-    if (!['auto', 'off', 'high', 'max'].includes(next.global.reasoning_effort)) {
+    // 「最大」这一档已从界面上去掉（实测对笔记任务是净伤害，见后端 generate_summary 那条）；
+    // 存过它的旧偏好按「质量」处理，不要静默变成"自动"
+    if (next.global.reasoning_effort === 'max') {
+        next.global.reasoning_effort = 'high';
+    }
+    if (!['auto', 'off', 'high'].includes(next.global.reasoning_effort)) {
         next.global.reasoning_effort = 'auto';
     }
     const theme = localStorage.getItem('theme');
@@ -872,8 +896,12 @@ function applyPreferencesToForm() {
     byId('includeScreenshots').checked = prefs.global.include_screenshots === true;
     byId('useGpu').checked = prefs.global.use_gpu === true;
     byId('summaryStyle').value = prefs.global.summary_style;
-    byId('reasoningEffort').value = ['auto', 'off', 'high', 'max'].includes(prefs.global.reasoning_effort)
-        ? prefs.global.reasoning_effort : 'auto';
+    // 存过「最大」的旧偏好落到「质量」而不是被判成非法值退回 auto：
+    // 这个 select 的值就是提交给后端的 reasoning_effort，静默变 auto 会改变实际档位
+    byId('reasoningEffort').value = prefs.global.reasoning_effort === 'max'
+        ? 'high'
+        : (['auto', 'off', 'high'].includes(prefs.global.reasoning_effort)
+            ? prefs.global.reasoning_effort : 'auto');
     const processingModeInput = document.querySelector(
         `input[name="processingMode"][value="${prefs.global.processing_mode}"]`
     );
@@ -2196,7 +2224,7 @@ async function pollTask(taskId) {
         if (Array.isArray(task.logs) && task.logs.length) updateLogs(task.logs);
 
         if (task.status === 'completed') {
-            await completeTask(task.result, task.elapsed_seconds);
+            await completeTask(task.result, task.elapsed_seconds, task.download_name);
             return;
         }
         if (task.status === 'failed') {
@@ -2281,6 +2309,7 @@ function resetTaskView() {
     currentTaskId = null;
     currentMarkdown = '';
     currentHtml = '';
+    currentDownloadName = '';
     setTranscriptTaskView(false);
     byId('progressArea').hidden = false;
     byId('resultArea').hidden = true;
@@ -2290,6 +2319,7 @@ function resetTaskView() {
     byId('regenerateBtn').disabled = true;
     byId('outputNotice').hidden = true;
     byId('outputPath').textContent = '';
+    byId('taskDirPath').textContent = '';
     renderTaskAdvisory(null);
     byId('networkState').textContent = '准备提交';
     byId('networkState').classList.remove('network-warning');
@@ -2308,8 +2338,9 @@ function setTranscriptTaskView(on) {
     byId('regenerateBtn').textContent = isTranscriptTask ? '基于字幕稿生成笔记' : '基于转录重新生成';
 }
 
-async function completeTask(result, elapsedSeconds = null) {
+async function completeTask(result, elapsedSeconds = null, downloadName = '') {
     stopPolling();
+    currentDownloadName = typeof downloadName === 'string' ? downloadName.trim() : '';
     stopElapsedTimer(elapsedSeconds ?? result?.processing_seconds ?? null);
     if (!await showResult(result)) return;
     setTaskActive(false);
@@ -2532,13 +2563,18 @@ async function showResult(result) {
     const outputDirectory = typeof result.output_directory === 'string'
         ? result.output_directory.trim()
         : '';
-    byId('outputPath').textContent = outputDirectory;
-    byId('outputNotice').hidden = !outputDirectory;
     const archivedPath = typeof result.archived_path === 'string'
         ? result.archived_path.trim()
         : '';
-    byId('archivedPath').textContent = archivedPath;
-    byId('archivedNotice').hidden = !archivedPath;
+    // 主行放"该拿的那一份"。归档文件名带视频标题，任务目录是一串 UUID 加固定名的中间
+    // 产物（notes.md / transcript.md）——把后者摆在主行，用户会以为产物就叫 transcript.md
+    // （群测原话），而下载和归档早就按标题命名了。
+    const primaryPath = archivedPath || outputDirectory;
+    byId('outputPathLabel').textContent = archivedPath ? '已保存到' : '输出文件已保存在';
+    byId('outputPath').textContent = primaryPath;
+    byId('outputNotice').hidden = !primaryPath;
+    byId('taskDirPath').textContent = outputDirectory;
+    byId('taskDirNotice').hidden = !(archivedPath && outputDirectory);
     return true;
 }
 
@@ -2695,7 +2731,11 @@ async function downloadSummary() {
         txt: { content: stripMarkdown(currentMarkdown), extension: '.txt', mime: 'text/plain' }
     };
     const selected = formats[format] || { content: currentMarkdown, extension: '.md', mime: 'text/markdown' };
-    triggerBlobDownload(new Blob([selected.content], { type: selected.mime }), selected.extension);
+    triggerBlobDownload(
+        new Blob([selected.content], { type: selected.mime }),
+        selected.extension,
+        noteFileName(selected.extension)
+    );
     showToast('下载已开始', 'success');
 }
 
@@ -2761,7 +2801,7 @@ async function exportSummaryImage() {
             }
             await downloadCanvasPages(canvas);
         } else {
-            triggerBlobDownload(await canvasToBlob(canvas), '.png');
+            triggerBlobDownload(await canvasToBlob(canvas), '.png', noteFileName('.png'));
         }
         showToast('图片导出已完成', 'success');
     } catch (error) {
@@ -2813,8 +2853,8 @@ async function downloadCanvasPages(source) {
             source.width,
             sliceHeight
         );
-        const suffix = `.page-${String(index + 1).padStart(3, '0')}.png`;
-        triggerBlobDownload(await canvasToBlob(page), suffix);
+        const suffix = `-page-${String(index + 1).padStart(3, '0')}.png`;
+        triggerBlobDownload(await canvasToBlob(page), suffix, noteFileName(suffix));
     }
 }
 
@@ -2834,7 +2874,7 @@ async function downloadMarkdownFile() {
         const response = await fetch(`${API_BASE}/download/${encodeURIComponent(currentTaskId)}`);
         if (!response.ok) throw new Error(await extractErrorMessage(response, '下载失败'));
         const filename = serverFilename(response);
-        triggerBlobDownload(await response.blob(), '.md', filename);
+        triggerBlobDownload(await response.blob(), '.md', filename || noteFileName('.md'));
         showToast(
             /\.zip$/i.test(filename) ? '笔记与截图已打包下载，解压后 .md 里才显示截图' : '下载已开始',
             'success'
@@ -2895,6 +2935,12 @@ function setDownloading(active) {
     button.querySelector('.btn-text').textContent = active ? '准备下载' : '下载';
 }
 
+// 网页端自己拼的文件名（txt / html / json / png）。后端清洗过分 P 与非法字符，
+// 这里只负责拼上扩展名；没有下载名时返回空串，让 triggerBlobDownload 兜时间戳。
+function noteFileName(extension) {
+    return currentDownloadName ? `${currentDownloadName}${extension}` : '';
+}
+
 function triggerBlobDownload(blob, extension, filename) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -2927,7 +2973,15 @@ function escapeHtml(value) {
 }
 
 async function readResponse(response, fallbackMessage) {
-    if (!response.ok) throw new Error(await extractErrorMessage(response, fallbackMessage));
+    if (!response.ok) {
+        const message = await extractErrorMessage(response, fallbackMessage);
+        // 裸 5xx（连 detail 都取不到）是 1.4.2 那批悬案的同款症状：应答的可能根本
+        // 不是本程序。自动补一次本机探测，把"端口被占/服务没答话"当场说清。
+        if (response.status >= 500 && message.endsWith(`（HTTP ${response.status}）`)) {
+            throw new Error(await probeLocalService(message));
+        }
+        throw new Error(message);
+    }
     try {
         return await response.json();
     } catch {
@@ -2955,6 +3009,143 @@ async function extractErrorMessage(response, fallbackMessage) {
     } catch {
         return `${fallbackMessage}（HTTP ${response.status}）`;
     }
+}
+
+let lastLocalProbeAt = 0;
+
+async function probeLocalService(baseMessage) {
+    const now = Date.now();
+    if (now - lastLocalProbeAt < 8000) return baseMessage; // 轮询类调用别反复体检
+    lastLocalProbeAt = now;
+    const verdict = await probeHealth();
+    return `${baseMessage}。自检：${verdict}`;
+}
+
+async function probeHealth() {
+    try {
+        const response = await fetchWithTimeout(`${API_BASE}/health`, {}, 2500);
+        const data = await response.json().catch(() => null);
+        if (data && data.service === 'VideoToNo') {
+            return '本机服务在答话，但刚才那个 5xx 的响应体不是它发的 JSON，多半是后端内部崩了'
+                + '（详情在 workspace\\_app.log；可点「本机自检」看完整报告）';
+        }
+        if (data) {
+            return `这个端口的应答不是 VideoToNo（${JSON.stringify(data).slice(0, 80)}）`
+                + '——端口被别的程序占着，托盘退出重开试试';
+        }
+        return '应答不是 JSON——端口八成被别的程序占了，托盘退出重开试试';
+    } catch {
+        return '本机服务没在答话——托盘可能已退出：右键托盘退出后重开，无效再重启电脑';
+    }
+}
+
+async function runDiagnostics() {
+    const button = byId('diagBtn');
+    const report = byId('diagReport');
+    button.disabled = true;
+    button.textContent = '自检中…';
+    report.hidden = false;
+    report.textContent = '正在自检（本机端口 / 系统代理 / DNS / 直连对比，约几秒）…';
+    try {
+        const [healthVerdict, payload] = await Promise.all([
+            probeHealth(),
+            fetchWithTimeout(`${API_BASE}/diagnostics`, {}, 20000)
+                .then((response) => readResponse(response, '自检请求失败'))
+                .catch((error) => ({ ok: false, error: error.message })),
+        ]);
+        renderDiagnostics(report, payload, healthVerdict);
+    } finally {
+        button.disabled = false;
+        button.textContent = '本机自检';
+    }
+}
+
+function formatDiagnosticsText(payload, healthVerdict) {
+    const lines = [];
+    if (payload && payload.ok) {
+        const checks = payload.checks || {};
+        const service = checks.service || {};
+        lines.push(`服务：VideoToNo v${service.version}（PID ${service.pid}，端口 ${service.port}，已运行 ${service.uptime_s} 秒）`);
+        const loopback = checks.loopback_http || {};
+        lines.push(`本机应答：${loopback.ok
+            ? `HTTP ${loopback.status}，${loopback.is_ours ? '是本程序' : '不是本程序！'}`
+            : `无应答（${loopback.error || '未知'}）`}`);
+        const winsock = checks.winsock || {};
+        lines.push(`Winsock：${winsock.ok ? `正常（试绑端口 ${winsock.port}）` : `异常（${winsock.error}）`}`);
+        const proxy = checks.system_proxy || {};
+        const registry = proxy.registry || {};
+        lines.push(`系统代理：环境变量 ${proxy.env || '无'}；Windows 注册表 ${registry.available
+            ? (registry.enabled
+                ? `已启用 ${registry.server}${registry.listening === false ? '（那个端口上没有进程在听！）' : ''}`
+                : '未启用')
+            : '读不到'}`);
+        Object.entries(checks.dns || {}).forEach(([host, entry]) => {
+            lines.push(`DNS ${host}：${entry.ok ? entry.addresses.join(' / ') : `失败（${entry.error}）`}`);
+        });
+        const describe = (probe) => (probe && probe.ok ? `通（HTTP ${probe.status}）` : `不通（${(probe && probe.error) || '未知'}）`);
+        const outbound = checks.outbound || {};
+        lines.push(`直连 api.deepseek.com：${describe(outbound.direct)}`);
+        lines.push(`走系统代理：${describe(outbound.with_system_proxy)}`);
+        lines.push(`扫码登录可用调试端口：${checks.cdp_ports_free} 个`);
+        (payload.hints || []).forEach((hint) => lines.push(`→ ${hint}`));
+    } else {
+        lines.push(`自检请求失败：${(payload && payload.error) || '未知原因'}`);
+        lines.push(`本机探测：${healthVerdict}`);
+    }
+    return lines.join('\n');
+}
+
+function renderDiagnostics(report, payload, healthVerdict) {
+    report.textContent = formatDiagnosticsText(payload, healthVerdict);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'button ghost compact-button';
+    copy.textContent = '复制报告';
+    copy.addEventListener('click', () => {
+        copyTextToClipboard(report.textContent, '自检报告已复制');
+    });
+    report.appendChild(document.createElement('br'));
+    report.appendChild(copy);
+}
+
+let updateOffer = null;
+
+async function runStartupUpdateCheck() {
+    try {
+        const response = await fetchWithTimeout(`${API_BASE}/update/check`, {}, 10000);
+        const data = await readResponse(response, '检查更新失败');
+        if (!data.ok || !data.update_available) return;
+        const ignored = (prefs.update && prefs.update.ignored_version) || '';
+        if (ignored && ignored === data.latest_version) return;
+        updateOffer = data;
+        const notes = data.notes ? data.notes.trim().slice(0, 300) : '';
+        byId('updateBody').textContent = `发现新版本 ${data.latest_version}（当前 v${data.current_version}）。`
+            + (notes ? `\n\n更新内容（节选）：\n${notes}` : '')
+            + '\n\n确定更新会打开 GitHub 发布页，下载后替换本程序即可。';
+        byId('updateModal').hidden = false;
+    } catch {
+        // 启动自检失败不打扰：网络常态问题，托盘菜单里随时可以手动检查
+    }
+}
+
+function acceptUpdateOffer() {
+    byId('updateModal').hidden = true;
+    if (updateOffer && updateOffer.release_url) {
+        window.open(updateOffer.release_url, '_blank', 'noopener');
+    }
+}
+
+function ignoreUpdateOffer() {
+    if (updateOffer && updateOffer.latest_version) {
+        prefs.update = prefs.update || {};
+        prefs.update.ignored_version = updateOffer.latest_version;
+        schedulePersist(persistPrefs);
+    }
+    byId('updateModal').hidden = true;
+}
+
+function dismissUpdateOffer() {
+    byId('updateModal').hidden = true;
 }
 
 function showToast(message, type = 'info') {

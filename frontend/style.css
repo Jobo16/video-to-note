@@ -706,3 +706,54 @@ input[type="checkbox"] {
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* 本机自检报告（/api/diagnostics 的渲染出口）：等宽观感、可滚动、带复制按钮 */
+.diag-report {
+    display: block;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--border) 14%, transparent);
+    font-size: 12.5px;
+    line-height: 1.75;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 340px;
+    overflow: auto;
+}
+
+/* 更新提示弹窗：确定更新 / 忽略本次更新 / 取消 */
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(0, 0, 0, 0.45);
+}
+.modal-card {
+    width: min(540px, 100%);
+    max-height: 80vh;
+    overflow: auto;
+    background: var(--surface-raised);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+}
+.update-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.8;
+    color: var(--text-soft);
+}
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    margin-top: 14px;
+}

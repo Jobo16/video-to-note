@@ -56,6 +56,44 @@ def test_note_images_are_resolved_on_every_output_path() -> None:
     assert "serverFilename(" in markdown_download, "带截图时后端发的是 zip，后缀不能写死"
 
 
+def test_browser_side_downloads_are_named_after_the_note() -> None:
+    """txt / html / json / png 由浏览器自己拼文件名，只能取后端下发的下载名。
+
+    写死 `video_summary_时间戳` 时，同一视频逐 P 导出的几份纯文本除了时间戳
+    全都一样，用户根本分不清哪份是哪个 P。
+    """
+    assert "function noteFileName(" in SCRIPT
+    for name in ("downloadSummary", "exportSummaryImage", "downloadCanvasPages"):
+        body = SCRIPT.split(f"function {name}(", 1)[1].split("\n}\n", 1)[0]
+        assert "noteFileName(" in body, f"{name} 里的下载没取后端下发的文件名"
+    assert SCRIPT.count("task.download_name") == 2, "打开任务与轮询完成两条路都要带上下载名"
+
+
+def test_completed_notice_leads_with_the_titled_file() -> None:
+    """群测原话"能不能用视频标题命名，现在都叫 transcript.md"——根因不是命名没做，是主行
+    摆的是 UUID 任务目录，用户点进去只看到固定名的中间产物，于是以为那就是产物名。
+
+    有归档时主行必须是带标题的归档文件；任务目录降成补充信息（音频与抽帧在里面，不能不告诉
+    用户），归档失败时退回原样。
+    """
+    body = SCRIPT.split("async function showResult(", 1)[1].split("\n}\n", 1)[0]
+    assert "archivedPath || outputDirectory" in body, "主行没优先取归档文件"
+    assert "taskDirNotice" in body, "任务目录被整条删掉了（音频与抽帧在里面）"
+    assert "outputPathLabel" in body, "主行换了含义，引导语必须跟着变，否则读起来是错的"
+
+
+def test_retired_effort_option_is_mapped_not_silently_reset() -> None:
+    """下拉里去了「最大」这一档，但存过它的浏览器偏好不能静默变成"自动"。
+
+    那个 select 的值就是提交给后端的 reasoning_effort，静默改档等于替用户决定跑什么。
+    偏好迁移与读取显示两处都要映射，只写一处就会退回 auto——第一版就漏了读取那处，
+    是浏览器里点出来的。
+    """
+    assert "next.global.reasoning_effort === 'max'" in SCRIPT, "迁移路径没映射 max"
+    assert "prefs.global.reasoning_effort === 'max'" in SCRIPT, "读取显示路径没映射 max"
+    assert '<option value="max">' not in PAGE, "「最大」不该再出现在下拉里"
+
+
 def test_every_bound_element_id_exists_in_the_page() -> None:
     missing = sorted(set(BOUND_ID.findall(SCRIPT)) - set(DECLARED_ID.findall(PAGE)))
     assert not missing, f"script.js 绑定了页面里不存在的元素：{missing}"

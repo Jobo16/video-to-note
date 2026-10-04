@@ -2,13 +2,13 @@
   <img src="sources/icon.png" width="96" alt="VideoToNo icon">
 </p>
 
-<h1 align="center">VideoToNo v1.4.2</h1>
+<h1 align="center">VideoToNo v1.4.5</h1>
 
 <p align="center"><em>Turn videos into Markdown notes you can revisit</em></p>
 
 <p align="center">🌐 <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a></p>
 
-<p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="Latest release"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
+<p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/actions/workflows/ci.yml"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/actions/workflow/status/like-attract/video-to-note/ci.yml?branch=main&style=flat-square&label=CI" alt="CI status"></a>&nbsp;<a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="Latest release"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
 
 <p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ Download the Windows portable build</strong></a></p>
 
@@ -18,15 +18,19 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 > 🤖 **Agent Skill available**: copy the `skills/video-to-note/` directory from this repo into your agent's skills directory (e.g. `~/.agents/skills/`) and coding agents like Claude Code or pi can generate video notes from a single sentence. See `SKILL.md` inside that directory.
 
-## 🆕 What's New (v1.4.1 → v1.4.2)
+## 🆕 What's New (v1.4.2 → v1.4.5)
 
-- **The model list is up to date**: DeepSeek V4.1 Flash, GLM-5.3 with the free GLM-4.7-Flash tier, and Qwen3.8 are now in the dropdown; nothing was removed, so profiles you saved keep working
-- **Errors tell you what to do next**: "connection test failed", "Bilibili returned nothing" and "the model produced no note body" used to end in a bare code. They now say whose problem it is and what to change — you won't be told to sign in again when the fix is a different reasoning tier
-- **A page that won't load says so**: instead of a lone Not Found you get a short set of steps, and the local port now shows next to the version, so two instances on one machine are easy to tell apart
-- **Paste a new link and the button resets**: it no longer sits on "Generate again" while you are clearly starting a different video
+- **Long videos and small local models finish in one run far more often**: when any single model request was rejected the whole task used to fail and everything already written was lost; now just that stretch is skipped and its original text stays in the note. Local models such as ollama succeed much more often on long videos
+- **Errors say what to change**: the "token limit" hit when a small model runs a long video is now plainly the model's context window being too small, with the way to widen it — you won't be sent to change a setting that does nothing on that channel
+- **Files finally look like files**: txt / html / json / PNG exports are named after the video title, Bilibili parts carry their part number, and "transcript only" is archived separately as `title【转录】.md`; the completion line now points straight at the file you want
+- **A transcription crash no longer takes the whole app down**: transcription runs in its own process, so a faulty model library fails that one task only — the app stays running and you can retry with another model
+- **Network trouble has a self-check now**: the connection test retries without a proxy and says which side failed, and a new self-check panel in the sidebar produces a full report when the page errors
+- **You hear about new versions**: one prompt per release — update, skip this version, or dismiss
 
 <details>
-<summary>Previous releases (v1.4.1 and earlier)</summary>
+<summary>Previous releases (v1.4.2 and earlier)</summary>
+
+- **v1.4.2**: built-in model IDs moved to each vendor's current names (nothing was removed, saved profiles keep working); "connection test failed", "Bilibili returned nothing" and "the model produced no note body" now say whose problem it is and what to change; a page that won't load gives a short set of steps and shows the local port next to the version; pasting a new link resets the button to "Generate".
 
 - **v1.4.1**: notes with screenshots keep their pictures on export (the Markdown download ships the screenshots, the HTML export carries them, old tasks just need re-exporting); the Whisper dropdown is labeled from on-device benchmarks; manual import for `paraformer-zh` no longer points at an empty folder; a "Let an agent connect (MCP)" section in the sidebar; API keys no longer appear in plain text in model errors, run logs or notifications.
 - **v1.4.0**: hour-plus lectures are now transcribed into a complete chronological note instead of losing the back half (3-hour courses no longer drop roughly 2 hours), with an overview plus a table of contents carrying time ranges; drafting is an order of magnitude faster (a 3-hour course in about 10 minutes); note formulas render in the preview and in exported Markdown; two faster Chinese engines (paraformer-zh, belle-turbo-zh) plus CPU decode tuning; transcription reports progress every 30 seconds; Bilibili multi-part selection before submitting, remembered per video; model profiles renameable from the dropdown; failure messages now name the platform and stage that actually need checking.
@@ -61,7 +65,7 @@ VideoToNo turns the **"video → structured notes" pipeline** into a local-first
 
 ## 🚀 Portable build (recommended)
 
-No Python or development setup is required. Download `VideoToNo-1.4.2-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
+No Python or development setup is required. Download `VideoToNo-1.4.5-portable.exe` from the [latest Release](https://github.com/like-attract/video-to-note/releases/latest):
 
 1. Download and double-click the exe;
 2. Wait for the local page to open in your browser;

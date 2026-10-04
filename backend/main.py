@@ -8,12 +8,16 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -45,11 +49,15 @@ class NoCacheStaticFiles(StaticFiles):
 from pydantic import BaseModel, Field, SecretStr
 
 from . import paraformer_asr, secret_box
+from . import asr_process
+from . import update_check
 from .config_store import BiliCredentialsUnavailable, LLM_KEYS_FILE, ConfigStore
 from .llm_summarizer import (
     LONG_TRANSCRIPT_CHARACTERS,
     LLMSummarizer,
     default_base_url,
+    env_proxy_summary,
+    mask_proxy_target,
     normalize_endpoint_host,
     utf8_safe,
 )
@@ -82,6 +90,10 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 WHISPER_CACHE_DIR = Path(
     os.getenv("WHISPER_CACHE_DIR", str(WORKSPACE_DIR / "_model_cache"))
 ).resolve()
+# workspace/ 下两个面向人的产物目录。转录稿单独一个目录而不是混进 notes/：先转写、后生成
+# 笔记的同一视频会各留一份，分开摆一眼看得清，不用靠【转录】后缀在一堆文件里认。
+NOTES_DIR_NAME = "notes"
+TRANSCRIPTS_DIR_NAME = "transcripts"
 FRONTEND_DIR = BASE_DIR / "frontend"
 APP_ICON_PATH = BASE_DIR / "sources" / "icon.png"
 FAVICON_PATH = BASE_DIR / "sources" / "icon.ico"
@@ -126,7 +138,7 @@ NOTE_IMAGE_REF_RE = re.compile(
     rf"(!\[[^\]]*\]\()\./(?:{FRAMES_DIR_NAME}|images)/([^)]+)\)"
 )
 
-app = FastAPI(title="VideoToNo API", version="1.4.2")
+app = FastAPI(title="VideoToNo API", version="1.4.5")
 
 
 def is_loopback_client(host: str | None) -> bool:
@@ -211,6 +223,10 @@ class LocalSecurityMiddleware:
 app.add_middleware(LocalSecurityMiddleware)
 
 
+_STARTED_MONO = time.monotonic()
+_LAST_BACKEND_ERRORS: deque[str] = deque(maxlen=5)
+
+
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """没兜住的异常一律回 JSON，而不是 uvicorn 那句纯文本 Internal Server Error。
@@ -218,12 +234,19 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     前端 `extractErrorMessage` 只在响应是 JSON 时才取得到原因，裸 500 会退化成
     "测试请求失败（HTTP 500）"——群里报障时既分不清是后端崩了、还是端口被别的
     服务占着，也拿不到任何线索。traceback 由 Starlette 原样继续上抛，仍会进
-    `_app.log`，这里只负责把话说清楚。
+    `_app.log`；最近几条（脱敏后）留在 `_LAST_BACKEND_ERRORS`，`/api/diagnostics`
+    会带出来当悬案线索。
     """
-    reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+    try:
+        reason = utf8_safe(f"{type(exc).__name__}: {exc}")[:300]
+        reason = redact_secrets(reason)
+        _LAST_BACKEND_ERRORS.append(f"{request.url.path}: {reason}")
+    except Exception:
+        # 兜错误的兜底自己也不能再炸：炸了就把话说到"有异常但构造不出说明"为止
+        reason = "后端内部错误（构造错误说明时又出了岔子，详情见本机 _app.log）"
     return JSONResponse(
         status_code=500,
-        content={"detail": f"后端内部错误：{redact_secrets(reason)}（详情见本机 _app.log）"},
+        content={"detail": f"后端内部错误：{reason}（详情见本机 _app.log）"},
     )
 
 
@@ -265,6 +288,28 @@ paraformer_transcriber = ParaformerTranscriber(WHISPER_CACHE_DIR)
 
 
 async def run_transcription(
+    media_path: Path,
+    model_name: str,
+    use_gpu: bool,
+    title: str | None,
+    cancel_event: Any,
+    progress_callback: Any = None,
+) -> dict:
+    """转写入口：打包版交给工人子进程，源码版在原进程里跑。
+
+    CTranslate2 / sherpa-onnx 在打包环境里出过一次访问违例（崩的是整个进程，
+    托盘和界面一起没，日志一个字都没留下），所以正式产物里的转写必须死在外头。
+    """
+    if asr_process.use_child_process():
+        return await asr_process.run_in_child(
+            media_path, model_name, use_gpu, title, cancel_event, progress_callback
+        )
+    return await run_transcription_local(
+        media_path, model_name, use_gpu, title, cancel_event, progress_callback
+    )
+
+
+async def run_transcription_local(
     media_path: Path,
     model_name: str,
     use_gpu: bool,
@@ -653,6 +698,8 @@ def load_reused_video_info(
         "timestamp": manifest.get("timestamp") or 0,
         "view_count": manifest.get("view_count") or 0,
         "like_count": manifest.get("like_count") or 0,
+        "bili_pages": manifest.get("bili_pages"),
+        "bili_total_pages": manifest.get("bili_total_pages"),
         "description": "",
     }
 
@@ -673,6 +720,10 @@ def update_task_manifest(task_id: str, info: dict[str, Any]) -> None:
         view_count=info.get("view_count"),
         like_count=info.get("like_count"),
     )
+    # 分 P 信息只在 B 站多 P 时才有，缺键的旧任务重开时不能把它写空
+    for key in ("bili_pages", "bili_total_pages"):
+        if info.get(key) is not None:
+            payload[key] = info[key]
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -828,6 +879,17 @@ def task_status_payload(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
     payload["source_url"] = source_url if source_url.startswith(("http://", "https://")) else None
     payload["uploaded_filename"] = payload.get("uploaded_filename") or manifest.get(
         "uploaded_filename"
+    )
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    payload["download_name"] = download_stem(
+        str(
+            result.get("title")
+            or manifest.get("title")
+            or manifest.get("uploaded_filename")
+            or ""
+        ),
+        manifest,
+        str(task.get("output") or manifest.get("output") or "note"),
     )
     return payload
 
@@ -1154,6 +1216,13 @@ async def test_llm_connection(
         )
     except RuntimeError as error:
         return {"ok": False, "error": str(error)}
+    except Exception as error:
+        # 密钥档案读不了（磁盘被拖垮 / DPAPI 失灵 / 文件损坏）不该裸 500：
+        # 1.4.2 悬案里前端只剩「（HTTP 500）」，就是这类异常漏出去了
+        return {
+            "ok": False,
+            "error": utf8_safe(f"读取本机保存的 Key 失败：{type(error).__name__}: {error}"),
+        }
     try:
         summarizer = LLMSummarizer(
             model_type=model_type,
@@ -1171,7 +1240,7 @@ async def test_llm_connection(
             "key_source": key_source,
         }
     except Exception as exc:
-        return {"ok": False, "error": f"初始化失败：{exc}"}
+        return {"ok": False, "error": utf8_safe(f"初始化失败：{exc}")}
 
 
 @app.delete("/api/llm-config")
@@ -1304,6 +1373,209 @@ async def health_check() -> dict[str, Any]:
             "mcp_sse": MCP_SSE_ENABLED,
         },
     }
+
+
+@app.get("/api/update/check")
+async def check_app_update() -> dict[str, Any]:
+    """启动自检用：对比 GitHub 最新 Release；连不上也回 200，前端静默不提示。
+
+    这里故意沿用系统代理的默认行为（与 CDP 那两处相反）：GitHub 恰恰是
+    常需要代理才够得着的地址，代理在场就该用。
+    """
+    return await asyncio.to_thread(update_check.check_summary, app.version)
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _http_probe(url: str, timeout: float = 4.0, *, use_proxy: bool) -> dict[str, Any]:
+    """只看"HTTP 层有没有应答"的探测：任何状态码都算通，应答体截一小段当证据。"""
+    try:
+        if use_proxy:
+            opener = urllib.request.build_opener()
+        else:
+            # 本机回环与直连对照都必须绕开代理：urllib 在 Windows 会读注册表系统代理
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(url, headers={"User-Agent": "VideoToNo-diagnostics"})
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read(240)
+            return {
+                "ok": True,
+                "status": response.status,
+                "body": utf8_safe(body.decode("utf-8", "replace")),
+            }
+    except urllib.error.HTTPError as exc:
+        # 收得到状态码说明网络层是通的（403/404 也算）
+        return {"ok": True, "status": exc.code, "body": ""}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:200]}
+
+
+def _resolve_host(host: str) -> dict[str, Any]:
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:160]}
+    return {"ok": True, "addresses": sorted({info[4][0] for info in infos})[:3]}
+
+
+def _winsock_probe() -> dict[str, Any]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return {"ok": True, "port": sock.getsockname()[1]}
+    except OSError as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _wininet_proxy_snapshot() -> dict[str, Any]:
+    """Windows 注册表里的系统代理：浏览器和 urllib 认它，httpx 不认——分开报。"""
+    if os.name != "nt":
+        return {"available": False}
+    try:
+        import winreg
+    except ImportError:
+        return {"available": False}
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled = bool(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "")
+            try:
+                override = str(winreg.QueryValueEx(key, "ProxyOverride")[0] or "")
+            except FileNotFoundError:
+                override = ""
+    except FileNotFoundError:
+        return {"available": True, "enabled": False}
+    except OSError as exc:
+        return {"available": True, "error": utf8_safe(str(exc))[:120]}
+    if not enabled or not server:
+        return {"available": True, "enabled": False}
+    # ProxyServer 可能是 "host:port"，也可能按协议写成 "http=…;https=…"
+    target = server
+    if "=" in server:
+        for part in server.split(";"):
+            if part.lower().startswith(("https=", "http=")):
+                target = part.split("=", 1)[1]
+                break
+    host, _, port_text = target.rpartition(":")
+    port = int(port_text) if port_text.isdigit() else 80
+    return {
+        "available": True,
+        "enabled": True,
+        "server": mask_proxy_target(target),
+        "override": override[:160],
+        "listening": _tcp_reachable(host or target, port, 1.0),
+    }
+
+
+def _count_free_cdp_ports(start: int = 9333, count: int = 20) -> int:
+    free = 0
+    for port in range(start, start + count):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", port))
+                free += 1
+        except OSError:
+            continue
+    return free
+
+
+@app.get("/api/diagnostics")
+async def run_diagnostics(request: Request) -> dict[str, Any]:
+    """本机自检：现场回答"测试连接/扫码登录 500"这类悬案能查的问题。
+
+    只读、零密钥：响应里永远不出现 Key 明文、cookie、代理地址的账号段。
+    """
+    server_port = request.url.port or (request.scope.get("server") or (None, None))[1]
+    checks: dict[str, Any] = {}
+    hints: list[str] = []
+
+    checks["service"] = {
+        "pid": os.getpid(),
+        "version": app.version,
+        "mode": "portable" if getattr(sys, "frozen", False) else "dev",
+        "port": server_port,
+        "uptime_s": int(time.monotonic() - _STARTED_MONO),
+    }
+
+    loopback = await asyncio.wait_for(
+        asyncio.to_thread(
+            _http_probe, f"http://127.0.0.1:{server_port}/api/health", 3.0, use_proxy=False
+        ),
+        timeout=6,
+    )
+    identity = None
+    try:
+        identity = json.loads(str(loopback.get("body") or "null"))
+    except ValueError:
+        pass
+    is_ours = isinstance(identity, dict) and identity.get("service") == "VideoToNo"
+    checks["loopback_http"] = {**loopback, "is_ours": is_ours}
+    if loopback.get("ok") and not is_ours:
+        hints.append(
+            f"127.0.0.1:{server_port} 上应答的不是本程序（开头是：{str(loopback.get('body') or '')[:60]}）"
+            "——端口被别的软件占着，或本机代理在截本机请求"
+        )
+    elif not loopback.get("ok"):
+        hints.append("本机 HTTP 服务没答上话——后端可能刚被搞挂，看 workspace\\_app.log")
+
+    checks["winsock"] = await asyncio.to_thread(_winsock_probe)
+
+    registry = await asyncio.to_thread(_wininet_proxy_snapshot)
+    checks["system_proxy"] = {"env": env_proxy_summary(), "registry": registry}
+    if registry.get("enabled") and registry.get("listening") is False:
+        hints.append(
+            f"Windows 系统代理指向 {registry.get('server')}，但那个地址没有进程在听"
+            "——代理/加速器多半僵死了：关掉它或重启电脑，软件不用重装"
+        )
+
+    dns_checks = {
+        host: await asyncio.wait_for(asyncio.to_thread(_resolve_host, host), timeout=8)
+        for host in ("api.deepseek.com", "passport.bilibili.com")
+    }
+    checks["dns"] = dns_checks
+    if all(not entry.get("ok") for entry in dns_checks.values()):
+        hints.append("两个域名都解析失败——DNS 或网络本身有问题：换手机热点试一次，不行再重启电脑")
+
+    direct = await asyncio.wait_for(
+        asyncio.to_thread(_http_probe, "https://api.deepseek.com", 5.0, use_proxy=False),
+        timeout=9,
+    )
+    via_proxy = await asyncio.wait_for(
+        asyncio.to_thread(_http_probe, "https://api.deepseek.com", 5.0, use_proxy=True),
+        timeout=9,
+    )
+    checks["outbound"] = {"direct": direct, "with_system_proxy": via_proxy}
+    if direct.get("ok") and not via_proxy.get("ok"):
+        hints.append("直连通、带系统代理出不去——就是本机代理/加速器的问题，关掉它即可，不用重启电脑")
+    if not direct.get("ok"):
+        hints.append("不走代理也出不去——到 api.deepseek.com 整条路不通（网卡/防火墙/驱动）；重启电脑仍不行就换网络")
+
+    checks["cdp_ports_free"] = await asyncio.to_thread(_count_free_cdp_ports)
+    try:
+        checks["llm_key_storage"] = {
+            "backend": secret_box.storage_backend(),
+            "corrupt": bool(config_store.keys_are_corrupt()),
+        }
+    except Exception as exc:
+        checks["llm_key_storage"] = {"error": f"{type(exc).__name__}: {utf8_safe(str(exc))}"[:120]}
+
+    recent = list(_LAST_BACKEND_ERRORS)
+    checks["recent_backend_errors"] = recent
+    if recent:
+        hints.append("后端近期抛过未兜住的异常（见 recent_backend_errors，对照 _app.log 的 Traceback）")
+
+    if not hints:
+        hints.append("各项自检没发现异常——把这份报告整段发给作者/群里，比一句 500 有用得多")
+    return {"ok": True, "checks": checks, "hints": hints}
 
 
 @app.post("/api/bili-login/start")
@@ -1447,7 +1719,9 @@ async def download_summary_markdown(task_id: str) -> Response:
         raise HTTPException(status_code=404, detail="Markdown 笔记不存在")
 
     title = (task.get("result") or {}).get("title", "video-notes")
-    safe_name = _safe_filename(title) or "video-notes"
+    safe_name = download_stem(
+        str(title), read_task_manifest(task_id), str(task.get("output") or "note")
+    )
     try:
         note_text = output_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -1683,6 +1957,12 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                             page.duration for page in subtitle_outcome.pages
                         ) or info.get("duration")
                     if subtitle_outcome.total_pages > 1:
+                        # 记下了本次覆盖哪几个分 P，产物文件名才带得出 P 号与分 P 名
+                        info["bili_pages"] = [
+                            {"page": page.page, "part": page.part}
+                            for page in subtitle_outcome.pages
+                        ]
+                        info["bili_total_pages"] = subtitle_outcome.total_pages
                         task["logs"].append(
                             f"检测到 B 站分 P 视频：共 {subtitle_outcome.total_pages} 个分 P，"
                             f"本次处理 {_format_page_nums(subtitle_outcome.pages)}"
@@ -1890,6 +2170,25 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             # 正文只留在 transcript.json / transcript.md：result 会被 wait_for_task
             # 每 2 秒轮询一次并由 persist_task_runtime 反复落盘，不能放大文本
             elapsed = finish_task_timing(task)
+            # 归档读的是刚落盘的那份 transcript.md（与下载端点同一个文件），不在这里
+            # 重新拼一遍格式——两处各拼一次迟早会对不上。
+            try:
+                transcript_markdown = (
+                    WORKSPACE_DIR / task_id / "transcript.md"
+                ).read_text(encoding="utf-8")
+            except OSError:
+                transcript_markdown = ""
+            archived_path = (
+                archive_note(
+                    download_stem(title, info, "transcript"),
+                    transcript_markdown,
+                    folder=TRANSCRIPTS_DIR_NAME,
+                )
+                if transcript_markdown
+                else None
+            )
+            if archived_path:
+                task["logs"].append(f"转录稿已归档：{archived_path}")
             task["result"] = {
                 "title": title,
                 "output": "transcript",
@@ -1901,6 +2200,7 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                 "transcript_language": transcript_result["language"],
                 "transcript_quality": quality,
                 "output_directory": str(WORKSPACE_DIR / task_id),
+                "archived_path": str(archived_path) if archived_path else None,
                 "processing_seconds": elapsed,
             }
             task.update(
@@ -2020,7 +2320,7 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
 
         task_dir = WORKSPACE_DIR / task_id
         (task_dir / "notes.md").write_text(summary, encoding="utf-8")
-        archived_path = archive_note(title, summary, task_id)
+        archived_path = archive_note(download_stem(title, info), summary, task_id)
         if archived_path:
             task["logs"].append(f"笔记已归档：{archived_path}")
         elapsed = finish_task_timing(task)
@@ -2141,8 +2441,31 @@ def friendly_task_error(
     return message
 
 
+# 各家对"上下文窗口不够"的说法不一样（ollama 两种、OpenAI/vLLM 一种、LM Studio 一种），
+# 但都带这些字样。刻意不含 "too many tokens"：OpenAI 限流的原文就是
+# `Too many tokens per minute`，按它判会把限流说成窗口不够。
+_CONTEXT_LIMIT_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "num_ctx",
+    "maximum capacity of",
+)
+
+
 def friendly_llm_error(lowered: str, message: str) -> str:
     """生成笔记阶段的失败来自模型通道，重投视频链接不会有任何改变。"""
+    # 放在额度/429 之前：下面几条判的是裸子串 "429"/"403"，而本类报错里的数字是
+    # token 数（`requested 9403 tokens` 就含 "403"），先判会把窗口不够说成权限问题。
+    if any(marker in lowered for marker in _CONTEXT_LIMIT_MARKERS):
+        return (
+            "模型的上下文窗口装不下本次请求（这是模型侧的容量上限，不是本程序的笔记长度设置）。"
+            "本地模型（ollama / LM Studio / llama.cpp）请把上下文调到 16K 以上再重投："
+            "ollama 设 OLLAMA_CONTEXT_LENGTH=16384 后重启服务，或在 Modelfile 里写 "
+            "`num_ctx 16384`。在线通道多为该模型或网关的上限较低，"
+            "可换上下文更大的模型，或改用「精简摘要」减少单次送入的材料。"
+        )
     if "insufficient_quota" in lowered or "quota" in lowered or "余额" in message:
         return (
             "模型通道的额度或余额不足，笔记生成中断。"
@@ -2316,11 +2639,39 @@ def append_note_footer(
     return f"{summary.rstrip()}\n\n{footer}\n"
 
 
+SAFE_NAME_LIMIT = 80
+
+
 def _safe_filename(value: str) -> str:
     """把标题清洗为安全的文件名：只去掉 Windows 非法字符，保留中文标点。"""
     invalid = set('\\/:*?"<>|')
     cleaned = "".join(char for char in value if char not in invalid and ord(char) >= 32)
-    return (cleaned.strip() or "video-notes")[:80]
+    return (cleaned.strip() or "video-notes")[:SAFE_NAME_LIMIT]
+
+
+def download_stem(title: str, meta: dict[str, Any], output: str = "note") -> str:
+    """产物文件名主干（不含扩展名），Markdown 下载、压缩包、归档和网页端共用。
+
+    B 站分 P 与纯转录都要带进名字：同一视频逐 P 跑出来的笔记、以及同一视频
+    先转写后生成的两份产物，否则在下载目录里只剩一串相同或时间戳文件名。
+    分 P 标记与转录正文里用的「【P3 分P名】」保持同一写法。
+    """
+    base = str(title or "").strip() or "video-notes"
+    suffix = ""
+    pages = [page for page in (meta.get("bili_pages") or []) if isinstance(page, dict)]
+    total = int(meta.get("bili_total_pages") or 0)
+    if total > 1 and pages:
+        if len(pages) == 1:
+            page = pages[0]
+            part = str(page.get("part") or "").strip()
+            suffix = f"【P{page.get('page')} {part}】" if part else f"【P{page.get('page')}】"
+        elif len(pages) < total:
+            suffix = f"【P{_format_page_nums([int(page['page']) for page in pages])}】"
+    if output == "transcript":
+        suffix += "【转录】"
+    if suffix and len(base) + len(suffix) > SAFE_NAME_LIMIT:
+        base = base[: max(1, SAFE_NAME_LIMIT - len(suffix))]
+    return _safe_filename(f"{base}{suffix}")
 
 
 def rewrite_note_image_refs(content: str, prefix: str) -> str:
@@ -2330,24 +2681,31 @@ def rewrite_note_image_refs(content: str, prefix: str) -> str:
     )
 
 
-def archive_note(title: str, content: str, task_id: str | None = None) -> Path | None:
-    """把笔记归档到 workspace/notes/ 下（按标题命名，重名自动加序号），便于集中回顾。
+def archive_note(
+    title: str,
+    content: str,
+    task_id: str | None = None,
+    folder: str = NOTES_DIR_NAME,
+) -> Path | None:
+    """把产物按标题命名归档到 workspace/<folder>/ 下（重名自动加序号），便于集中回顾。
 
-    截图不复制：归档在 notes/ 下，与任务目录同在 workspace/ 里，引用改写成
+    默认 notes/；纯转录走 transcripts/，与笔记分开摆。
+
+    截图不复制：归档在 workspace/ 的子目录下，与任务目录同级，引用改写成
     ../<task_id>/frames/ 就能就地看图，代价是删掉任务后归档里的图失效。
 
     返回归档路径；写入失败时返回 None（不影响任务本身）。
     """
-    notes_root = WORKSPACE_DIR / "notes"
+    archive_root = WORKSPACE_DIR / folder
     if task_id:
         content = rewrite_note_image_refs(content, f"../{task_id}/")
     try:
-        notes_root.mkdir(parents=True, exist_ok=True)
+        archive_root.mkdir(parents=True, exist_ok=True)
         safe = _safe_filename(title)
-        candidate = notes_root / f"{safe}.md"
+        candidate = archive_root / f"{safe}.md"
         index = 2
         while candidate.exists():
-            candidate = notes_root / f"{safe}-{index}.md"
+            candidate = archive_root / f"{safe}-{index}.md"
             index += 1
         candidate.write_text(content, encoding="utf-8")
         return candidate
