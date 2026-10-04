@@ -83,7 +83,10 @@ async def test_native_crash_of_worker_becomes_a_failing_task(tmp_path, monkeypat
     with pytest.raises(asr_process.TranscriptionWorkerDied) as raised:
         await asr_process.run_in_child(tmp_path / "a.mp3", "small", False, "标题")
 
-    assert "0xC0000005" in str(raised.value)
+    # 同一个 `os._exit(-1073741819)`：Windows 原样回 0xC0000005，POSIX 只留低 8 位（= 5）。
+    # 这条要钉的是"退出码进了文案"，怎么渲染另有 test_exit_code_is_printed_as_ntstatus 管
+    expected_code = 0xC0000005 if sys.platform == "win32" else 5
+    assert asr_process.format_exit_code(expected_code) in str(raised.value)
     assert "程序本身仍在运行" in str(raised.value)
 
 
