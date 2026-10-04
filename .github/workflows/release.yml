@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  # 手动跑一次"只构建、不发版"：产物走 artifact，给人测包用。
+  # 补这个入口是因为 ci.yml 不出包、release.yml 又只在 tag 上出包，于是"发版前想给人
+  # 测包"只剩本地打这一条路——而本地打会把构建机 System32 的 VC++ 运行时原样收进 exe
+  # 并盖过用户自己那份（2026-10 群测两个转写引擎都 0xC0000005 就是这么来的）。
+  # 触发后 publish 这个 job 会被下面的 if 跳过，不会建 Release、不会刷 feed。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -83,6 +89,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build-windows
+    # workflow_dispatch 的手动跑只到 build-windows 为止：没有 tag 就没有版本号，
+    # 让它跑下去会拿分支名去 gh release create
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository

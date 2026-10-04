@@ -59,6 +59,28 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "dist\VideoToNo.exe") -Destinatio
 $latest = Join-Path $projectRoot "dist\VideoToNo-portable.exe"
 Copy-Item -LiteralPath (Join-Path $projectRoot "dist\VideoToNo.exe") -Destination $latest -Force
 Remove-Item -LiteralPath (Join-Path $projectRoot "dist\VideoToNo.exe") -Force
+
+# 包内自带的 VC++ 运行时必须是现代版本。PyInstaller 收的是构建机 System32 的那一份，
+# 而包内 DLL 在搜索顺序上盖过用户自己的 System32 —— 构建机脏一次，每个用户拿到的包都
+# 跟着崩。2026-10 群测 faster-whisper 与 sherpa-onnx 两个引擎都 0xC0000005，出错模块
+# MSVCP140.dll 14.0.24215.1，就是这么漏出去的（CI 那份是 14.40，所以只影响本地包）。
+# 门槛定 14.10：msvcp140_1.dll 这个组件从 VS2017 15.3 才有，base 比 _1 老一整条产品线是
+# 不被支持的组合。宁可构建红叉，也不要发一个"用户一点就静默消失、日志一行不剩"的包。
+$runtimeDir = Join-Path $projectRoot ".tmp\bundle-runtimes"
+& $Python (Join-Path $projectRoot "scripts\extract_bundle_runtimes.py") $target --out $runtimeDir
+if ($LASTEXITCODE -ne 0) { throw "抽不出包内运行时，无法判断版本（PyInstaller 可能没收到）" }
+foreach ($dllName in @("msvcp140.dll", "vcruntime140.dll")) {
+    $dllPath = Join-Path $runtimeDir $dllName
+    if (-not (Test-Path -LiteralPath $dllPath)) { throw "包里没有 $dllName" }
+    $version = (Get-Item -LiteralPath $dllPath).VersionInfo.FileVersion
+    if ($version -notmatch '^(\d+)\.(\d+)') { throw "$dllName 版本号读不出来：$version" }
+    Write-Host ("  包内运行时 {0} -> {1}" -f $dllName, $version)
+    if ([int]$Matches[1] -lt 14 -or ([int]$Matches[1] -eq 14 -and [int]$Matches[2] -lt 10)) {
+        throw ("包内 $dllName 是 $version，低于 14.10。先修复构建机的 VC++ 2015-2022 可再发行组件" +
+               "（System32 里那份太旧）再重打，否则这个包会在转写时崩掉用户的任务。")
+    }
+}
+
 Write-Host ""
 Write-Host "构建完成: $target" -ForegroundColor Green
 Write-Host "固定名（快捷方式可指向此文件）: $latest" -ForegroundColor Cyan
