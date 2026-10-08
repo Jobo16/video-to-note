@@ -10,4 +10,4 @@ test -d /opt/stacks/url2audio/data
 cd "$repo_dir"
 docker compose -f url2audio/compose.yaml build
 docker compose -f url2audio/compose.yaml up -d
-curl -fsS --retry 20 --retry-delay 2 http://127.0.0.1:14175/health >/dev/null
+curl -fsS --retry 20 --retry-connrefused --retry-delay 2 http://127.0.0.1:14175/health >/dev/null
