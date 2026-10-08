@@ -9,7 +9,7 @@
 
 <p align="center"><span style="white-space: nowrap;"><a href="https://github.com/like-attract/video-to-note/actions/workflows/ci.yml"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/actions/workflow/status/like-attract/video-to-note/ci.yml?branch=main&style=flat-square&label=CI" alt="CI 状态"></a>&nbsp;<a href="https://github.com/like-attract/video-to-note/releases/latest"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/v/release/like-attract/video-to-note?display_name=tag&style=flat-square&label=release&color=2563eb" alt="最新版本"></a>&nbsp;<a href="LICENSE"><img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/github/license/like-attract/video-to-note?style=flat-square&label=license&color=22c55e" alt="MIT License"></a>&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/frontend-Vanilla%20JS-E34F26?style=flat-square&logo=javascript&logoColor=white" alt="Frontend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/backend-FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="Backend">&nbsp;<img style="display: inline-block; vertical-align: middle;" src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11"></span></p>
 
-<p align="center"><a href="https://github.com/like-attract/video-to-note/releases/latest"><strong>⬇️ 下载 Windows 便携版</strong></a></p>
+<p align="center"><a href="#-macos-启动">🍎 macOS 启动</a> · <a href="https://github.com/like-attract/video-to-note/releases/latest">⬇️ 下载 Windows 便携版</a></p>
 
 <p align="center">🎬 宣传视频：<a href="https://www.bilibili.com/video/BV1Qwby6DEu1/">https://www.bilibili.com/video/BV1Qwby6DEu1/</a> &nbsp;·&nbsp; 👥 QQ 交流群：<code>739200648</code></p>
 
@@ -64,7 +64,19 @@ VideoToNo 把「视频 → 结构化笔记」这条链路做成了一个**本地
 
 <p align="center"><img src="sources/output-public.png" alt="VideoToNo 生成的详细视频笔记" width="100%"></p>
 
-## 🚀 便携版下载（推荐）
+## 🍎 macOS 启动
+
+安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)、`ffmpeg`（`brew install ffmpeg`）和 Chrome，然后在终端运行：
+
+```bash
+git clone https://github.com/Jobo16/video-to-note.git
+cd video-to-note
+./start-macos.sh
+```
+
+首次启动会安装依赖；之后会自动打开本机网页。选择「仅转录字幕」无需 API Key，中文视频可先用 `paraformer-zh`。任务与笔记保存在仓库的 `workspace/` 目录。
+
+## 🚀 Windows 便携版下载
 
 普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.5-portable.exe`：
 
@@ -122,7 +134,17 @@ faster-whisper 本地转写
 <details>
 <summary>🧑‍💻 源码运行与构建（开发者）</summary>
 
-源码用户直接 `git clone` 或在 GitHub 选择 **Code → Download ZIP** 即可获取完整项目。项目主要面向 Windows + Python 3.11，安装 `backend/requirements.txt` 后可使用 `start.ps1` 启动；需要自行构建便携版时运行：
+源码用户直接 `git clone` 或在 GitHub 选择 **Code → Download ZIP** 即可获取完整项目。
+
+macOS：安装 `uv` 和 `ffmpeg`，并安装 Chrome、Edge 或 Chromium。首次运行会自动创建 Python 3.11 虚拟环境并安装依赖；后续直接运行同一脚本。抖音网页解析会使用本机浏览器。转录推荐先选择 CPU 上运行的 Paraformer 中文模型。
+
+```bash
+git clone https://github.com/Jobo16/video-to-note.git
+cd video-to-note
+./start-macos.sh
+```
+
+Windows + Python 3.11：安装 `backend/requirements.txt` 后使用 `start.ps1` 启动；需要自行构建便携版时运行：
 
 ```powershell
 git clone https://github.com/like-attract/video-to-note.git

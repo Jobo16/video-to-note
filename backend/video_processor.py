@@ -816,10 +816,13 @@ class VideoProcessor:
             if self.detect_source(url) != VideoSource.DOUYIN:
                 raise RuntimeError("yt-dlp completed without producing an audio file")
             info = self._douyin_media_cache.get(url) or self._extract_douyin_share_info(url, cookie)
-            media_url = info.get("_douyin_video_url") or info.get("_douyin_audio_url")
+            media_url = info.get("_douyin_audio_url") or info.get("_douyin_video_url")
             if not media_url:
                 raise RuntimeError(f"抖音未返回可下载媒体地址（{ydl_error!s}）")
-            return self._download_direct_media(media_url, task_dir / "audio.mp4", url, cookie)
+            suffix = ".m4a" if info.get("_douyin_audio_url") else ".mp4"
+            return self._download_direct_media(
+                media_url, task_dir / f"{media_name}{suffix}", url, cookie, should_abort=should_abort
+            )
 
         return await asyncio.to_thread(_download)
 
@@ -1054,10 +1057,8 @@ class VideoProcessor:
                 raise RuntimeError("抖音分享页未找到视频详情")
             video = item.get("video") or {}
             video_urls = self._url_list(video.get("play_addr"))
-            audio_urls = self._url_list((item.get("music") or {}).get("play_url"))
             video_url = next((value.replace("playwm", "play") for value in video_urls if value), None)
-            audio_url = next((value for value in audio_urls if value), None)
-            if not video_url and not audio_url:
+            if not video_url:
                 raise RuntimeError("抖音详情没有可下载媒体地址")
             author = item.get("author") or {}
             info = {
@@ -1074,12 +1075,61 @@ class VideoProcessor:
                 "subtitles": {},
                 "automatic_captions": {},
                 "_douyin_video_url": video_url,
-                "_douyin_audio_url": audio_url,
+                "_douyin_audio_url": None,
             }
             self._douyin_media_cache[url] = info
             return info
         except Exception as exc:
-            raise RuntimeError(f"Douyin share-page parse failed: {exc}") from exc
+            try:
+                info = self._extract_douyin_browser_info(url, cookie)
+                self._douyin_media_cache[url] = info
+                return info
+            except Exception as browser_exc:
+                raise RuntimeError(
+                    f"抖音分享页和浏览器均未取得视频：{exc}；{browser_exc}"
+                ) from browser_exc
+
+    @staticmethod
+    def _extract_douyin_browser_info(url: str, cookie: dict[str, str] | None) -> dict[str, Any]:
+        from .douyin_browser import capture_detail
+
+        item = capture_detail(url, cookie)
+        video = item["video"]
+        audio_url = next((
+            value
+            for track in video.get("bit_rate_audio") or []
+            for urls in [(track.get("audio_meta") or {}).get("url_list") or {}]
+            for value in (urls.get("main_url"), urls.get("backup_url"))
+            if isinstance(value, str) and value.startswith("https://")
+        ), None)
+        video_url = next((
+            value for address in (video.get("play_addr_h264"), video.get("play_addr"))
+            for value in VideoProcessor._url_list(address)
+            if value.startswith("https://")
+        ), None)
+        if not audio_url and not video_url:
+            raise RuntimeError("抖音网页详情没有可下载的音视频地址")
+        expected_id = re.search(r"/video/(\d+)", url)
+        if expected_id and str(item.get("aweme_id")) != expected_id.group(1):
+            raise RuntimeError("抖音网页返回的作品 ID 与请求不一致")
+        author = item.get("author") or {}
+        statistics = item.get("statistics") or {}
+        return {
+            "title": item.get("desc") or "Untitled video",
+            "source": VideoSource.DOUYIN.value,
+            "duration": round(float(video.get("duration") or 0) / 1000, 3),
+            "owner": author.get("nickname") or author.get("unique_id") or "",
+            "upload_date": "",
+            "timestamp": item.get("create_time") or 0,
+            "description": (item.get("desc") or "")[:1_000],
+            "thumbnail": (VideoProcessor._url_list(video.get("origin_cover")) or [""])[0],
+            "view_count": int(statistics.get("play_count") or 0),
+            "like_count": int(statistics.get("digg_count") or 0),
+            "subtitles": {},
+            "automatic_captions": {},
+            "_douyin_video_url": video_url,
+            "_douyin_audio_url": audio_url,
+        }
 
     @staticmethod
     def _request_text(

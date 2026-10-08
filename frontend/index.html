@@ -173,7 +173,7 @@
             </div>
             <p class="mcp-note">可以跟 agent 说「先把这个视频转成带时间轴的文字稿」——它走 <code>transcribe_video</code> + <code>get_transcript</code>，<strong>本机不需要配 API Key</strong>，整理成什么样由客户端的模型决定；要一份现成成品笔记才用 <code>summarize_video</code>（需要 Key）。</p>
             <p class="mcp-note">只支持 stdio 的客户端可以跑 <code>python -m backend.mcp_server</code>，它会自动找 8000–8019 上已经开着的本服务。</p>
-            <p class="mcp-note">服务只监听 <code>127.0.0.1</code>，局域网连不进来；Key 和 B 站凭据只留在本机（Windows 用系统 DPAPI 加密）。</p>
+            <p class="mcp-note">服务只监听 <code>127.0.0.1</code>，局域网连不进来；Key 和 B 站凭据只留在本机（Windows 用系统 DPAPI 加密，macOS 明文存储）。</p>
             <p id="mcpUnavailable" class="mcp-note" hidden>这台机器没装 <code>mcp</code> 依赖，上面的地址暂时连不通（网页端和任务本身不受影响）。装齐 <code>backend/requirements.txt</code> 里的依赖后重启即可。</p>
         </details>
 
