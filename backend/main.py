@@ -67,6 +67,7 @@ from .transcript import (
     TranscriptSegment,
     format_timestamp,
     segments_to_prompt,
+    segments_to_srt,
     transcript_quality,
 )
 from .video_processor import (
@@ -2189,6 +2190,12 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             )
             if archived_path:
                 task["logs"].append(f"转录稿已归档：{archived_path}")
+                srt_path = WORKSPACE_DIR / task_id / "transcript.srt"
+                if srt_path.is_file():
+                    try:
+                        shutil.copyfile(srt_path, archived_path.with_suffix(".srt"))
+                    except OSError as exc:
+                        task["logs"].append(f"SRT 字幕归档失败：{exc}")
             task["result"] = {
                 "title": title,
                 "output": "transcript",
@@ -2392,6 +2399,9 @@ async def write_transcript_files(
     await _write_atomically(
         task_dir / "transcript.md",
         ("# 带时间戳转录\n\n", segments_to_prompt(segments), "\n"),
+    )
+    await _write_atomically(
+        task_dir / "transcript.srt", (segments_to_srt(segments),)
     )
 
 

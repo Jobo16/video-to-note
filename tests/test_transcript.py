@@ -9,6 +9,7 @@ from backend.transcript import (
     merge_segment_lines,
     parse_subtitle_payload,
     segments_to_prompt,
+    segments_to_srt,
     transcript_quality,
 )
 
@@ -51,6 +52,16 @@ def test_prompt_uses_real_segment_timestamps() -> None:
     prompt = segments_to_prompt([TranscriptSegment(65, 72, "有时间依据的内容")])
     assert prompt == "[01:05-01:12] 有时间依据的内容"
     assert format_timestamp(3_661) == "01:01:01"
+
+
+def test_srt_preserves_segment_timestamps_and_text() -> None:
+    subtitles = segments_to_srt(
+        [TranscriptSegment(0.17, 1.84, " 第一段 "), TranscriptSegment(61, 62.5, "Next line")]
+    )
+    assert subtitles == (
+        "1\n00:00:00,170 --> 00:00:01,840\n第一段\n\n"
+        "2\n00:01:01,000 --> 00:01:02,500\nNext line\n\n"
+    )
 
 
 def test_chunking_keeps_segment_boundaries() -> None:

@@ -34,6 +34,21 @@ def segments_to_prompt(segments: Sequence[TranscriptSegment]) -> str:
     )
 
 
+def segments_to_srt(segments: Sequence[TranscriptSegment]) -> str:
+    def timestamp(seconds: float) -> str:
+        milliseconds = max(0, round(seconds * 1000))
+        hours, remainder = divmod(milliseconds, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
+        return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+    return "".join(
+        f"{index}\n{timestamp(segment.start)} --> {timestamp(segment.end)}\n"
+        f"{segment.text.strip()}\n\n"
+        for index, segment in enumerate(segments, 1)
+    )
+
+
 def merge_segment_lines(
     segments: Sequence[TranscriptSegment], target_characters: int = 48
 ) -> list[TranscriptSegment]:

@@ -352,5 +352,6 @@ async def test_transcript_files_are_written_atomically(tmp_path, monkeypatch) ->
     task_dir = tmp_path / task_id
     assert not (task_dir / "transcript.json.tmp").exists()
     assert not (task_dir / "transcript.md.tmp").exists()
+    assert not (task_dir / "transcript.srt.tmp").exists()
     payload = json.loads((task_dir / "transcript.json").read_text(encoding="utf-8"))
     assert payload["segments"][0]["text"] == "测试内容"

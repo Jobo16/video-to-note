@@ -76,6 +76,24 @@ cd video-to-note
 
 首次启动会安装依赖；之后会自动打开本机网页。选择「仅转录字幕」无需 API Key。中文视频默认用 `paraformer-zh`，英语视频在「Whisper 模型」中选 `small`。任务与笔记保存在仓库的 `workspace/` 目录。
 
+### 本机抖音链接转录流程
+
+给出分享链接后，按这次已验证的流程处理到本地字幕为止：
+
+1. 启动 VideoToNo，调用 `POST http://127.0.0.1:8000/api/transcribe`，传入 `video_url`、`prefer_subtitles: false`、`use_gpu: false`。中文用 `whisper_model: "paraformer-zh"`，英文用 `whisper_model: "small"`。这会实际下载媒体并在本机转写，不调用笔记大模型。
+2. 用返回的 `task_id` 查询 `GET /api/task/{task_id}`，等到 `status` 为 `completed`。核对语言、段数，并抽查开头、中间和结尾；识别错误保留在原始稿中，后续需要时再校对。
+3. 在 `workspace/<task_id>/` 查看媒体、`transcript.json`、`transcript.md` 和 `transcript.srt`。完成后，Markdown 稿和同名 SRT 字幕也会归档到 `workspace/transcripts/`。
+
+例如向接口提交英文链接：
+
+```bash
+curl -sS http://127.0.0.1:8000/api/transcribe \
+  -H 'Content-Type: application/json' \
+  -d '{"video_url":"https://v.douyin.com/OxW1b-RKAXk/","prefer_subtitles":false,"whisper_model":"small","use_gpu":false}'
+```
+
+网页端的「仅转录字幕」仍默认优先平台字幕；需要复现这次的**本地模型转写**时，使用上述接口参数。
+
 ## 🚀 Windows 便携版下载
 
 普通用户无需安装 Python 或配置开发环境，直接下载 [最新 Release](https://github.com/like-attract/video-to-note/releases/latest) 中的 `VideoToNo-1.4.5-portable.exe`：

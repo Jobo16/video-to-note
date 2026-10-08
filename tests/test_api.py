@@ -1401,8 +1401,10 @@ async def test_transcript_only_task_archives_a_titled_transcript(
     assert archived.parent == tmp_path / main.TRANSCRIPTS_DIR_NAME
     assert archived.name == "课程 第一讲【转录】.md"
     assert "口播内容" in archived.read_text(encoding="utf-8")
+    assert "口播内容" in archived.with_suffix(".srt").read_text(encoding="utf-8")
     # 工作目录里那份照旧留着：音频、transcript.json 与它都在，排查时还要用
     assert (tmp_path / task_id / "transcript.md").is_file()
+    assert (tmp_path / task_id / "transcript.srt").is_file()
 
 
 @pytest.mark.asyncio
