@@ -4,6 +4,8 @@ services:
       context: ..
       dockerfile: url2audio/Dockerfile
       network: host
+      args:
+        URL2AUDIO_BUILD_PROXY: http://127.0.0.1:7890
     network_mode: host
     env_file: /opt/stacks/url2audio/.env
     volumes:
