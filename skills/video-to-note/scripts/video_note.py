@@ -103,7 +103,7 @@ def find_service() -> str:
             continue
     die(
         "本机 8000-8019 端口未发现 VideoToNo 服务。请先启动 VideoToNo"
-        "（便携版 exe，或源码目录执行 python launcher.py）后重试。"
+        "（macOS 源码目录执行 ./start-macos.sh；Windows 用便携版 exe 或 start.ps1）后重试。"
     )
 
 

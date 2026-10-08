@@ -25,7 +25,7 @@ curl -s --max-time 2 http://127.0.0.1:8000/api/health
 # 期望返回 {"status":"ok","service":"VideoToNo",...}
 ```
 
-全部端口不通时：请用户启动 VideoToNo（便携版 exe，或源码目录执行 `python launcher.py`），启动后重试。不要替用户猜端口以外的地址。
+全部端口不通时：请用户启动 VideoToNo（macOS 源码目录执行 `./start-macos.sh`；Windows 用便携版 exe 或 `start.ps1`），启动后重试。不要替用户猜端口以外的地址。
 
 ## 推荐方式：用附带脚本一条命令完成
 

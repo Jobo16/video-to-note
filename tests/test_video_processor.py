@@ -95,6 +95,7 @@ def test_douyin_share_page_info_mapping(tmp_path: Path, monkeypatch: pytest.Monk
                             "duration": 12_500,
                             "play_addr": {"url_list": ["https://v.douyinvod.com/playwm/demo.mp4"]},
                         },
+                        "music": {"play_url": {"url_list": ["https://v.douyinvod.com/background.mp3"]}},
                         "statistics": {"play_count": 42},
                     }]
                 }
@@ -115,6 +116,34 @@ def test_douyin_share_page_info_mapping(tmp_path: Path, monkeypatch: pytest.Monk
     assert info["duration"] == 12.5
     assert info["owner"] == "作者"
     assert info["_douyin_video_url"].endswith("/play/demo.mp4")
+    assert info["_douyin_audio_url"] is None
+
+
+def test_douyin_browser_info_prefers_spoken_audio_track(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend import douyin_browser
+
+    monkeypatch.setattr(douyin_browser, "capture_detail", lambda _url, _cookie: {
+        "aweme_id": "123456",
+        "desc": "测试抖音视频",
+        "author": {"nickname": "作者"},
+        "video": {
+            "duration": 12_500,
+            "bit_rate_audio": [{"audio_meta": {"url_list": {
+                "backup_url": "https://example.com/backup.m4a",
+                "main_url": "https://example.com/speech.m4a",
+            }}}],
+            "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+        },
+    })
+
+    info = VideoProcessor._extract_douyin_browser_info(
+        "https://www.douyin.com/video/123456", None
+    )
+    assert info["_douyin_audio_url"] == "https://example.com/speech.m4a"
+    assert info["_douyin_video_url"] == "https://example.com/video.mp4"
+    assert info["duration"] == 12.5
 
 
 def test_extract_info_preserves_publish_and_engagement_metadata(

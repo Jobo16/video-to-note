@@ -21,7 +21,7 @@
             banner.className = 'script-failure-banner';
             banner.setAttribute('role', 'alert');
             banner.textContent =
-                '页面脚本未正常加载，按钮可能无响应。请按 Ctrl+F5 强制刷新；' +
+                '页面脚本未正常加载，按钮可能无响应。请强制刷新页面；' +
                 '若仍无效，请通过托盘菜单「打开界面」重新访问。';
             document.body.appendChild(banner);
         }, 2500);
