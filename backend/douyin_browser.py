@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from .douyin_login import find_browser
+BROWSER_PATHS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome",
+)
+
+
+def find_browser() -> str | None:
+    return next((path for path in BROWSER_PATHS if os.path.isfile(path)), None)
 
 
 def capture_detail(url: str, cookies: dict[str, str] | None = None) -> dict[str, Any]:
@@ -17,7 +28,12 @@ def capture_detail(url: str, cookies: dict[str, str] | None = None) -> dict[str,
         raise RuntimeError("缺少 Playwright；macOS 请运行 ./start-macos.sh 完成安装") from exc
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(executable_path=browser_path, headless=True)
+        browser = playwright.chromium.launch(
+            executable_path=browser_path,
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            if os.getenv("URL2AUDIO_CONTAINER") == "1" else [],
+        )
         try:
             context = browser.new_context()
             if cookies:

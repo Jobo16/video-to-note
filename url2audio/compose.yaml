@@ -1,0 +1,11 @@
+services:
+  url2audio:
+    build:
+      context: ..
+      dockerfile: url2audio/Dockerfile
+    network_mode: host
+    env_file: /opt/stacks/url2audio/.env
+    volumes:
+      - /opt/stacks/url2audio/data:/data
+    restart: unless-stopped
+    mem_limit: 1g
