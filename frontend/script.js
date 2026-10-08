@@ -606,7 +606,7 @@ function defaultPrefs() {
         by_provider: {},
         confirmations: { whisper_download: {} },
         global: {
-            whisper_model: 'base',
+            whisper_model: 'paraformer-zh',
             screenshot_interval: '10',
             include_screenshots: false,
             use_gpu: false,

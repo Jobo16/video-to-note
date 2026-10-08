@@ -31,15 +31,16 @@ curl -s --max-time 2 http://127.0.0.1:8000/api/health
 
 ```bash
 # 转录路线（默认推荐，零配置）
-python "<本技能目录>/scripts/video_note.py" "<视频链接或本地文件路径>" --transcript-only --wait 1800
+python "<本技能目录>/scripts/video_note.py" "<视频链接或本地文件路径>" --transcript-only --whisper-model paraformer-zh --wait 1800
 
 # 笔记路线（一键成品）
-python "<本技能目录>/scripts/video_note.py" "<视频链接或本地文件路径>" --style detailed --wait 1800
+python "<本技能目录>/scripts/video_note.py" "<视频链接或本地文件路径>" --style detailed --whisper-model paraformer-zh --wait 1800
 ```
 
 脚本会自动：探测服务端口 → （本地文件先上传）→ 提交任务 → 轮询进度（实时打印运行日志）→ 输出完整 Markdown。
 
 - `--transcript-only`：只做到转录为止，不调用大模型；此模式**默认复用同链接已有的转录**（秒回），加 `--no-reuse` 才强制重新转写
+- `--whisper-model`：中文优先 `paraformer-zh`；英语或中英频繁切换时改用 `small`
 - `--style`：`detailed`（翔实+点评，默认）/ `faithful`（忠实复原）/ `concise`（精简摘要）
 - `--wait`：最长等待秒数，默认 1800；长视频（>30 分钟）建议加大
 - `--out <path.md>`：把结果写入文件（不加则打印到 stdout）

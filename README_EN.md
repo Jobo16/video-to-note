@@ -73,7 +73,7 @@ cd video-to-note
 ./start-macos.sh
 ```
 
-The first launch installs dependencies and opens the local web page. Choose **Transcript only** to avoid an API key; `paraformer-zh` is a good starting point for Chinese speech. Tasks and notes are saved under `workspace/`.
+The first launch installs dependencies and opens the local web page. Choose **Transcript only** to avoid an API key. Chinese speech defaults to `paraformer-zh`; select `small` under **Whisper model** for English speech. Tasks and notes are saved under `workspace/`.
 
 ## 🚀 Windows portable build
 
@@ -294,7 +294,7 @@ Downloads and cached files are verified for integrity; corrupt leftovers from in
 
 ### Why is CPU transcription slower than the video duration?
 
-Speed depends on CPU performance, media duration, and model size. CPU mode uses `int8` to reduce resource pressure, but `medium`, `large-v3`, and `turbo` can still be slow and memory-intensive. Start with `base` on a personal computer, and enable GPU mode only after confirming CUDA works correctly.
+Speed depends on CPU performance, media duration, and model size. CPU mode uses `int8` to reduce resource pressure, but `medium`, `large-v3`, and `turbo` can still be slow and memory-intensive. On a Mac, select `paraformer-zh` for Chinese or `small` for English. The NVIDIA GPU option only applies to CUDA-capable machines.
 
 ### Why would I need a Bilibili cookie?
 

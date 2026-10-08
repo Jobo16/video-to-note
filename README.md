@@ -74,7 +74,7 @@ cd video-to-note
 ./start-macos.sh
 ```
 
-首次启动会安装依赖；之后会自动打开本机网页。选择「仅转录字幕」无需 API Key，中文视频可先用 `paraformer-zh`。任务与笔记保存在仓库的 `workspace/` 目录。
+首次启动会安装依赖；之后会自动打开本机网页。选择「仅转录字幕」无需 API Key。中文视频默认用 `paraformer-zh`，英语视频在「Whisper 模型」中选 `small`。任务与笔记保存在仓库的 `workspace/` 目录。
 
 ## 🚀 Windows 便携版下载
 
@@ -293,7 +293,7 @@ agent 会调用技能附带的 `scripts/video_note.py`，自动探测服务端�
 
 ### CPU 转写为什么比视频时长还久？
 
-速度取决于 CPU、视频时长和模型大小。CPU 模式使用 `int8` 降低资源压力，但 `medium`、`large-v3` 和 `turbo` 仍可能较慢并占用较多内存。个人电脑建议先使用 `base`；确认 CUDA 环境可用后再启用 GPU。
+速度取决于 CPU、视频时长和模型大小。CPU 模式使用 `int8` 降低资源压力，但 `medium`、`large-v3` 和 `turbo` 仍可能较慢并占用较多内存。Mac 上中文优先选 `paraformer-zh`，英语选 `small`；NVIDIA GPU 选项仅适用于有 CUDA 环境的机器。
 
 ### 为什么需要 B 站 Cookie？
 

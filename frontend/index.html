@@ -111,13 +111,13 @@
                 <span>Whisper 模型</span>
                 <select id="whisperModel">
                     <option value="tiny">tiny（最快）</option>
-                    <option value="base" selected>base（默认，下载较小）</option>
-                    <option value="small">small（中文更准确）</option>
+                    <option value="base">base（下载较小）</option>
+                    <option value="small">small（英语推荐 · 中英通用）</option>
                     <option value="medium">medium（不推荐 · 中文不如下面两档）</option>
                     <option value="large-v3">large-v3（不推荐 · 只有多语言视频才需要）</option>
                     <option value="turbo">turbo（不推荐 · 中文有退化，只适合多语言提速）</option>
                     <option value="belle-turbo-zh">belle-turbo-zh（中文推荐 · 精度最好）</option>
-                    <option value="paraformer-zh">paraformer-zh（中文推荐 · 最快最准，只支持中文）</option>
+                    <option value="paraformer-zh" selected>paraformer-zh（中文默认 · 长视频快）</option>
                 </select>
             </label>
             <div class="manual-model-row">
@@ -126,7 +126,7 @@
             </div>
             <label class="check-field">
                 <input type="checkbox" id="useGpu">
-                <span>启用 NVIDIA GPU 加速</span>
+                <span>启用 NVIDIA GPU 加速（Mac 不适用）</span>
             </label>
             <label class="check-field" id="includeScreenshotsField">
                 <input type="checkbox" id="includeScreenshots">
